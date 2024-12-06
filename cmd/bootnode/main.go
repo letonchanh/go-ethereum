@@ -147,7 +147,7 @@ func main() {
 	}
 
 	for _, seedNode := range seedNodes {
-		log.Debug("Adding seed node", seedNode)
+		log.Debug("Adding seed node", "addr", seedNode)
 		node, err := enode.Parse(enode.ValidSchemes, seedNode)
 		if err != nil {
 			utils.Fatalf("%v", err)
