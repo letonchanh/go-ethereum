@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
@@ -33,6 +34,21 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/nat"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 )
+
+// stringSlice is a flag.Value that implements a slice of strings.
+type stringSlice []string
+
+// String returns the slice of strings as a comma-separated string.
+// It implements the flag.Value interface
+func (s *stringSlice) String() string {
+	return strings.Join(*s, ",")
+}
+
+// Set appends a string to the slice of strings.
+func (s *stringSlice) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
 
 func main() {
 	var (
@@ -47,9 +63,11 @@ func main() {
 		verbosity   = flag.Int("verbosity", 3, "log verbosity (0-5)")
 		vmodule     = flag.String("vmodule", "", "log verbosity pattern")
 
-		nodeKey *ecdsa.PrivateKey
-		err     error
+		nodeKey   *ecdsa.PrivateKey
+		seedNodes stringSlice
+		err       error
 	)
+	flag.Var(&seedNodes, "seednode", "External node to connect to")
 	flag.Parse()
 
 	glogger := log.NewGlogHandler(log.NewTerminalHandler(os.Stderr, false))
@@ -127,6 +145,16 @@ func main() {
 		PrivateKey:  nodeKey,
 		NetRestrict: restrictList,
 	}
+
+	for _, seedNode := range seedNodes {
+		log.Debug("Adding seed node", seedNode)
+		node, err := enode.Parse(enode.ValidSchemes, seedNode)
+		if err != nil {
+			utils.Fatalf("%v", err)
+		}
+		cfg.Bootnodes = append(cfg.Bootnodes, node)
+	}
+
 	if *runv5 {
 		if _, err := discover.ListenV5(conn, ln, cfg); err != nil {
 			utils.Fatalf("%v", err)
