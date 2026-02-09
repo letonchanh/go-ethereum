@@ -20,7 +20,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
@@ -31,11 +33,10 @@ import (
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/internal/flags"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
-	cli "github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v2"
 )
 
 var (
@@ -49,7 +50,7 @@ var (
 				Usage:     "Prune stale ethereum state data based on the snapshot",
 				ArgsUsage: "<root>",
 				Action:    pruneState,
-				Flags: flags.Merge([]cli.Flag{
+				Flags: slices.Concat([]cli.Flag{
 					utils.BloomFilterSizeFlag,
 				}, utils.NetworkFlags, utils.DatabaseFlags),
 				Description: `
@@ -69,7 +70,7 @@ WARNING: it's only supported in hash mode(--state.scheme=hash)".
 				Usage:     "Recalculate state hash based on the snapshot for verification",
 				ArgsUsage: "<root>",
 				Action:    verifyState,
-				Flags:     flags.Merge(utils.NetworkFlags, utils.DatabaseFlags),
+				Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 				Description: `
 geth snapshot verify-state <state-root>
 will traverse the whole accounts and storages set based on the specified
@@ -82,21 +83,21 @@ In other words, this command does the snapshot to trie conversion.
 				Usage:     "Check that there is no 'dangling' snap storage",
 				ArgsUsage: "<root>",
 				Action:    checkDanglingStorage,
-				Flags:     flags.Merge(utils.NetworkFlags, utils.DatabaseFlags),
+				Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 				Description: `
-geth snapshot check-dangling-storage <state-root> traverses the snap storage 
-data, and verifies that all snapshot storage data has a corresponding account. 
+geth snapshot check-dangling-storage <state-root> traverses the snap storage
+data, and verifies that all snapshot storage data has a corresponding account.
 `,
 			},
 			{
 				Name:      "inspect-account",
-				Usage:     "Check all snapshot layers for the a specific account",
+				Usage:     "Check all snapshot layers for the specific account",
 				ArgsUsage: "<address | hash>",
 				Action:    checkAccount,
-				Flags:     flags.Merge(utils.NetworkFlags, utils.DatabaseFlags),
+				Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 				Description: `
 geth snapshot inspect-account <address | hash> checks all snapshot layers and prints out
-information about the specified address. 
+information about the specified address.
 `,
 			},
 			{
@@ -104,7 +105,7 @@ information about the specified address.
 				Usage:     "Traverse the state with given root hash and perform quick verification",
 				ArgsUsage: "<root>",
 				Action:    traverseState,
-				Flags:     flags.Merge(utils.NetworkFlags, utils.DatabaseFlags),
+				Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 				Description: `
 geth snapshot traverse-state <state-root>
 will traverse the whole state from the given state root and will abort if any
@@ -119,13 +120,13 @@ It's also usable without snapshot enabled.
 				Usage:     "Traverse the state with given root hash and perform detailed verification",
 				ArgsUsage: "<root>",
 				Action:    traverseRawState,
-				Flags:     flags.Merge(utils.NetworkFlags, utils.DatabaseFlags),
+				Flags:     slices.Concat(utils.NetworkFlags, utils.DatabaseFlags),
 				Description: `
 geth snapshot traverse-rawstate <state-root>
 will traverse the whole state from the given root and will abort if any referenced
 trie node or contract code is missing. This command can be used for state integrity
 verification. The default checking target is the HEAD state. It's basically identical
-to traverse-state, but the check granularity is smaller. 
+to traverse-state, but the check granularity is smaller.
 
 It's also usable without snapshot enabled.
 `,
@@ -135,7 +136,7 @@ It's also usable without snapshot enabled.
 				Usage:     "Dump a specific block from storage (same as 'geth dump' but using snapshots)",
 				ArgsUsage: "[? <blockHash> | <blockNum>]",
 				Action:    dumpState,
-				Flags: flags.Merge([]cli.Flag{
+				Flags: slices.Concat([]cli.Flag{
 					utils.ExcludeCodeFlag,
 					utils.ExcludeStorageFlag,
 					utils.StartKeyFlag,
@@ -143,10 +144,21 @@ It's also usable without snapshot enabled.
 				}, utils.NetworkFlags, utils.DatabaseFlags),
 				Description: `
 This command is semantically equivalent to 'geth dump', but uses the snapshots
-as the backend data source, making this command a lot faster. 
+as the backend data source, making this command a lot faster.
 
 The argument is interpreted as block number or hash. If none is provided, the latest
 block is used.
+`,
+			},
+			{
+				Action:    snapshotExportPreimages,
+				Name:      "export-preimages",
+				Usage:     "Export the preimage in snapshot enumeration order",
+				ArgsUsage: "<dumpfile> [<root>]",
+				Flags:     utils.DatabaseFlags,
+				Description: `
+The export-preimages command exports hash preimages to a flat file, in exactly
+the expected order for the overlay tree migration.
 `,
 			},
 		},
@@ -205,25 +217,13 @@ func verifyState(ctx *cli.Context) error {
 		log.Error("Failed to load head block")
 		return errors.New("no head block")
 	}
-	triedb := utils.MakeTrieDatabase(ctx, chaindb, false, true)
+	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
 	defer triedb.Close()
 
-	snapConfig := snapshot.Config{
-		CacheSize:  256,
-		Recovery:   false,
-		NoBuild:    true,
-		AsyncBuild: false,
-	}
-	snaptree, err := snapshot.New(snapConfig, chaindb, triedb, headBlock.Root())
-	if err != nil {
-		log.Error("Failed to open snapshot tree", "err", err)
-		return err
-	}
-	if ctx.NArg() > 1 {
-		log.Error("Too many arguments given")
-		return errors.New("too many arguments")
-	}
-	var root = headBlock.Root()
+	var (
+		err  error
+		root = headBlock.Root()
+	)
 	if ctx.NArg() == 1 {
 		root, err = parseRoot(ctx.Args().First())
 		if err != nil {
@@ -231,12 +231,34 @@ func verifyState(ctx *cli.Context) error {
 			return err
 		}
 	}
-	if err := snaptree.Verify(root); err != nil {
-		log.Error("Failed to verify state", "root", root, "err", err)
-		return err
+	if triedb.Scheme() == rawdb.PathScheme {
+		if err := triedb.VerifyState(root); err != nil {
+			log.Error("Failed to verify state", "root", root, "err", err)
+			return err
+		}
+		log.Info("Verified the state", "root", root)
+
+		// TODO(rjl493456442) implement dangling checks in pathdb.
+		return nil
+	} else {
+		snapConfig := snapshot.Config{
+			CacheSize:  256,
+			Recovery:   false,
+			NoBuild:    true,
+			AsyncBuild: false,
+		}
+		snaptree, err := snapshot.New(snapConfig, chaindb, triedb, headBlock.Root())
+		if err != nil {
+			log.Error("Failed to open snapshot tree", "err", err)
+			return err
+		}
+		if err := snaptree.Verify(root); err != nil {
+			log.Error("Failed to verify state", "root", root, "err", err)
+			return err
+		}
+		log.Info("Verified the state", "root", root)
+		return snapshot.CheckDanglingStorage(chaindb)
 	}
-	log.Info("Verified the state", "root", root)
-	return snapshot.CheckDanglingStorage(chaindb)
 }
 
 // checkDanglingStorage iterates the snap storage data, and verifies that all
@@ -260,7 +282,7 @@ func traverseState(ctx *cli.Context) error {
 	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 
-	triedb := utils.MakeTrieDatabase(ctx, chaindb, false, true)
+	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
 	defer triedb.Close()
 
 	headBlock := rawdb.ReadHeadBlock(chaindb)
@@ -369,7 +391,7 @@ func traverseRawState(ctx *cli.Context) error {
 	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 
-	triedb := utils.MakeTrieDatabase(ctx, chaindb, false, true)
+	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
 	defer triedb.Close()
 
 	headBlock := rawdb.ReadHeadBlock(chaindb)
@@ -416,7 +438,7 @@ func traverseRawState(ctx *cli.Context) error {
 		log.Error("Failed to open iterator", "root", root, "err", err)
 		return err
 	}
-	reader, err := triedb.Reader(root)
+	reader, err := triedb.NodeReader(root)
 	if err != nil {
 		log.Error("State is non-existent", "root", root)
 		return nil
@@ -529,24 +551,21 @@ func dumpState(ctx *cli.Context) error {
 	stack, _ := makeConfigNode(ctx)
 	defer stack.Close()
 
-	conf, db, root, err := parseDumpConfig(ctx, stack)
+	db := utils.MakeChainDatabase(ctx, stack, true)
+	defer db.Close()
+
+	conf, root, err := parseDumpConfig(ctx, db)
 	if err != nil {
 		return err
 	}
-	triedb := utils.MakeTrieDatabase(ctx, db, false, true)
+	triedb := utils.MakeTrieDatabase(ctx, stack, db, false, true, false)
 	defer triedb.Close()
 
-	snapConfig := snapshot.Config{
-		CacheSize:  256,
-		Recovery:   false,
-		NoBuild:    true,
-		AsyncBuild: false,
-	}
-	snaptree, err := snapshot.New(snapConfig, db, triedb, root)
+	stateIt, err := utils.NewStateIterator(triedb, db, root)
 	if err != nil {
 		return err
 	}
-	accIt, err := snaptree.AccountIterator(root, common.BytesToHash(conf.Start))
+	accIt, err := stateIt.AccountIterator(root, common.BytesToHash(conf.Start))
 	if err != nil {
 		return err
 	}
@@ -568,11 +587,11 @@ func dumpState(ctx *cli.Context) error {
 			return err
 		}
 		da := &state.DumpAccount{
-			Balance:   account.Balance.String(),
-			Nonce:     account.Nonce,
-			Root:      account.Root.Bytes(),
-			CodeHash:  account.CodeHash,
-			SecureKey: accIt.Hash().Bytes(),
+			Balance:     account.Balance.String(),
+			Nonce:       account.Nonce,
+			Root:        account.Root.Bytes(),
+			CodeHash:    account.CodeHash,
+			AddressHash: accIt.Hash().Bytes(),
 		}
 		if !conf.SkipCode && !bytes.Equal(account.CodeHash, types.EmptyCodeHash.Bytes()) {
 			da.Code = rawdb.ReadCode(db, common.BytesToHash(account.CodeHash))
@@ -580,7 +599,7 @@ func dumpState(ctx *cli.Context) error {
 		if !conf.SkipStorage {
 			da.Storage = make(map[common.Hash]string)
 
-			stIt, err := snaptree.StorageIterator(root, accIt.Hash(), common.Hash{})
+			stIt, err := stateIt.StorageIterator(root, accIt.Hash(), common.Hash{})
 			if err != nil {
 				return err
 			}
@@ -602,6 +621,42 @@ func dumpState(ctx *cli.Context) error {
 	log.Info("Snapshot dumping complete", "accounts", accounts,
 		"elapsed", common.PrettyDuration(time.Since(start)))
 	return nil
+}
+
+// snapshotExportPreimages dumps the preimage data to a flat file.
+func snapshotExportPreimages(ctx *cli.Context) error {
+	if ctx.NArg() < 1 {
+		utils.Fatalf("This command requires an argument.")
+	}
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	chaindb := utils.MakeChainDatabase(ctx, stack, true)
+	defer chaindb.Close()
+
+	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
+	defer triedb.Close()
+
+	var root common.Hash
+	if ctx.NArg() > 1 {
+		hash := ctx.Args().Get(1)
+		if !common.IsHexHash(hash) {
+			return fmt.Errorf("invalid hash: %s", ctx.Args().Get(1))
+		}
+		root = common.HexToHash(hash)
+	} else {
+		headBlock := rawdb.ReadHeadBlock(chaindb)
+		if headBlock == nil {
+			log.Error("Failed to load head block")
+			return errors.New("no head block")
+		}
+		root = headBlock.Root()
+	}
+	stateIt, err := utils.NewStateIterator(triedb, chaindb, root)
+	if err != nil {
+		return err
+	}
+	return utils.ExportSnapshotPreimages(chaindb, stateIt, ctx.Args().First(), root)
 }
 
 // checkAccount iterates the snap data layers, and looks up the given account

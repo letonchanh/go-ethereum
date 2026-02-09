@@ -28,10 +28,10 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/beacon"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -139,7 +139,7 @@ func TestGraphQLBlockSerialization(t *testing.T) {
 		// should return `estimateGas` as decimal
 		{
 			body: `{"query": "{block{ estimateGas(data:{}) }}"}`,
-			want: `{"data":{"block":{"estimateGas":"0xcf08"}}}`,
+			want: `{"data":{"block":{"estimateGas":"0xd221"}}}`,
 			code: 200,
 		},
 		// should return `status` as decimal
@@ -147,6 +147,11 @@ func TestGraphQLBlockSerialization(t *testing.T) {
 			body: `{"query": "{block {number call (data : {from : \"0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b\", to: \"0x6295ee1b4f6dd65047762f924ecd367c17eabf8f\", data :\"0x12a7b914\"}){data status}}}"}`,
 			want: `{"data":{"block":{"number":"0xa","call":{"data":"0x","status":"0x1"}}}}`,
 			code: 200,
+		},
+		{
+			body: `{"query": "{blocks {number}}"}`,
+			want: `{"errors":[{"message":"from block number must be specified","path":["blocks"]}],"data":null}`,
+			code: 400,
 		},
 	} {
 		resp, err := http.Post(fmt.Sprintf("%s/graphql", stack.HTTPEndpoint()), "application/json", strings.NewReader(tt.body))
@@ -163,6 +168,9 @@ func TestGraphQLBlockSerialization(t *testing.T) {
 		}
 		if tt.code != resp.StatusCode {
 			t.Errorf("testcase %d %s,\nwrong statuscode, have: %v, want: %v", i, tt.body, resp.StatusCode, tt.code)
+		}
+		if ctype := resp.Header.Get("Content-Type"); ctype != "application/json" {
+			t.Errorf("testcase %d \nwrong Content-Type, have: %v, want: %v", i, ctype, "application/json")
 		}
 	}
 }
@@ -181,7 +189,7 @@ func TestGraphQLBlockSerializationEIP2718(t *testing.T) {
 		Config:     params.AllEthashProtocolChanges,
 		GasLimit:   11500000,
 		Difficulty: big.NewInt(1048576),
-		Alloc: core.GenesisAlloc{
+		Alloc: types.GenesisAlloc{
 			address: {Balance: funds},
 			// The address 0xdad sloads 0x00 and 0x01
 			dad: {
@@ -278,7 +286,7 @@ func TestGraphQLConcurrentResolvers(t *testing.T) {
 			Config:     params.AllEthashProtocolChanges,
 			GasLimit:   11500000,
 			Difficulty: big.NewInt(1048576),
-			Alloc: core.GenesisAlloc{
+			Alloc: types.GenesisAlloc{
 				addr: {Balance: big.NewInt(params.Ether)},
 				dad: {
 					// LOG0(0, 0), LOG0(0, 0), RETURN(0, 0)
@@ -329,8 +337,8 @@ func TestGraphQLConcurrentResolvers(t *testing.T) {
 		},
 		// Multiple fields of block race to resolve header and body.
 		{
-			body: "{ block { number hash gasLimit ommerCount transactionCount totalDifficulty } }",
-			want: fmt.Sprintf(`{"block":{"number":"0x1","hash":"%s","gasLimit":"0xaf79e0","ommerCount":"0x0","transactionCount":"0x3","totalDifficulty":"0x200000"}}`, chain[len(chain)-1].Hash()),
+			body: "{ block { number hash gasLimit ommerCount transactionCount } }",
+			want: fmt.Sprintf(`{"block":{"number":"0x1","hash":"%s","gasLimit":"0xaf79e0","ommerCount":"0x0","transactionCount":"0x3"}}`, chain[len(chain)-1].Hash()),
 		},
 		// Multiple fields of a block race to resolve the header and body.
 		{
@@ -371,7 +379,7 @@ func TestWithdrawals(t *testing.T) {
 			Config:     params.AllEthashProtocolChanges,
 			GasLimit:   11500000,
 			Difficulty: common.Big1,
-			Alloc: core.GenesisAlloc{
+			Alloc: types.GenesisAlloc{
 				addr: {Balance: big.NewInt(params.Ether)},
 			},
 		}
@@ -422,6 +430,40 @@ func TestWithdrawals(t *testing.T) {
 	}
 }
 
+// TestGraphQLMaxDepth ensures that queries exceeding the configured maximum depth
+// are rejected to prevent resource exhaustion from deeply nested operations.
+func TestGraphQLMaxDepth(t *testing.T) {
+	stack := createNode(t)
+	defer stack.Close()
+
+	h, err := newHandler(stack, nil, nil, []string{}, []string{})
+	if err != nil {
+		t.Fatalf("could not create graphql service: %v", err)
+	}
+
+	var b strings.Builder
+	for i := 0; i < maxQueryDepth+1; i++ {
+		b.WriteString("ommers{")
+	}
+	b.WriteString("number")
+	for i := 0; i < maxQueryDepth+1; i++ {
+		b.WriteString("}")
+	}
+	query := fmt.Sprintf("{block{%s}}", b.String())
+
+	res := h.Schema.Exec(context.Background(), query, "", nil)
+	var found bool
+	for _, err := range res.Errors {
+		if err.Rule == "MaxDepthExceeded" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected max depth exceeded error, got %v", res.Errors)
+	}
+}
+
 func createNode(t *testing.T) *node.Node {
 	stack, err := node.New(&node.Config{
 		HTTPHost:     "127.0.0.1",
@@ -444,18 +486,19 @@ func newGQLService(t *testing.T, stack *node.Node, shanghai bool, gspec *core.Ge
 		TrieDirtyCache: 5,
 		TrieTimeout:    60 * time.Minute,
 		SnapshotCache:  5,
+		RPCGasCap:      1000000,
+		StateScheme:    rawdb.HashScheme,
 	}
-	var engine consensus.Engine = ethash.NewFaker()
+	var engine = beacon.New(ethash.NewFaker())
 	if shanghai {
-		engine = beacon.NewFaker()
-		chainCfg := gspec.Config
-		chainCfg.TerminalTotalDifficultyPassed = true
-		chainCfg.TerminalTotalDifficulty = common.Big0
+		gspec.Config.TerminalTotalDifficulty = common.Big0
+		gspec.Config.MergeNetsplitBlock = common.Big0
 		// GenerateChain will increment timestamps by 10.
 		// Shanghai upgrade at block 1.
 		shanghaiTime := uint64(5)
-		chainCfg.ShanghaiTime = &shanghaiTime
+		gspec.Config.ShanghaiTime = &shanghaiTime
 	}
+
 	ethBackend, err := eth.New(stack, ethConf)
 	if err != nil {
 		t.Fatalf("could not create eth backend: %v", err)

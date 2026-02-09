@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -36,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -50,21 +52,28 @@ const (
 	// transaction. There can be multiple of these embedded into a single tx.
 	blobSize = params.BlobTxFieldElementsPerBlob * params.BlobTxBytesPerFieldElement
 
-	// maxBlobsPerTransaction is the maximum number of blobs a single transaction
-	// is allowed to contain. Whilst the spec states it's unlimited, the block
-	// data slots are protocol bound, which implicitly also limit this.
-	maxBlobsPerTransaction = params.MaxBlobGasPerBlock / params.BlobTxBlobGasPerBlob
-
 	// txAvgSize is an approximate byte size of a transaction metadata to avoid
 	// tiny overflows causing all txs to move a shelf higher, wasting disk space.
 	txAvgSize = 4 * 1024
 
-	// txMaxSize is the maximum size a single transaction can have, outside
-	// the included blobs. Since blob transactions are pulled instead of pushed,
-	// and only a small metadata is kept in ram, the rest is on disk, there is
-	// no critical limit that should be enforced. Still, capping it to some sane
-	// limit can never hurt.
+	// txBlobOverhead is an approximation of the overhead that an additional blob
+	// has on transaction size. This is added to the slotter to avoid tiny
+	// overflows causing all txs to move a shelf higher, wasting disk space. A
+	// small buffer is added to the proof overhead.
+	txBlobOverhead = uint32(kzg4844.CellProofsPerBlob*len(kzg4844.Proof{}) + 64)
+
+	// txMaxSize is the maximum size a single transaction can have, including the
+	// blobs. Since blob transactions are pulled instead of pushed, and only a
+	// small metadata is kept in ram, the rest is on disk, there is no critical
+	// limit that should be enforced. Still, capping it to some sane limit can
+	// never hurt, which is aligned with maxBlobsPerTx constraint enforced internally.
 	txMaxSize = 1024 * 1024
+
+	// maxBlobsPerTx is the maximum number of blobs that a single transaction can
+	// carry. We choose a smaller limit than the protocol-permitted MaxBlobsPerBlock
+	// in order to ensure network and txpool stability.
+	// Note: if you increase this, validation will fail on txMaxSize.
+	maxBlobsPerTx = params.BlobTxMaxBlobs
 
 	// maxTxsPerAccount is the maximum number of blob transactions admitted from
 	// a single account. The limit is enforced to minimize the DoS potential of
@@ -81,6 +90,20 @@ const (
 	// limboedTransactionStore is the subfolder containing the currently included
 	// but not yet finalized transaction blobs.
 	limboedTransactionStore = "limbo"
+
+	// storeVersion is the current slotter layout used for the billy.Database
+	// store.
+	storeVersion = 1
+
+	// gappedLifetime is the approximate duration for which nonce-gapped transactions
+	// are kept before being dropped. Since gapped is only a reorder buffer and it
+	// is expected that the original transactions were inserted in the mempool in
+	// nonce order, the duration is kept short to avoid DoS vectors.
+	gappedLifetime = 1 * time.Minute
+
+	// maxGappedTxs is the maximum number of gapped transactions kept overall.
+	// This is a safety limit to avoid DoS vectors.
+	maxGapped = 128
 )
 
 // blobTxMeta is the minimal subset of types.BlobTx necessary to validate and
@@ -88,9 +111,13 @@ const (
 // bare minimum needed fields to keep the size down (and thus number of entries
 // larger with the same memory consumption).
 type blobTxMeta struct {
-	hash common.Hash // Transaction hash to maintain the lookup table
-	id   uint64      // Storage ID in the pool's persistent store
-	size uint32      // Byte size in the pool's persistent store
+	hash    common.Hash   // Transaction hash to maintain the lookup table
+	vhashes []common.Hash // Blob versioned hashes to maintain the lookup table
+	version byte          // Blob transaction version to determine proof type
+
+	id          uint64 // Storage ID in the pool's persistent store
+	storageSize uint32 // Byte size in the pool's persistent store
+	size        uint64 // RLP-encoded size of transaction including the attached blob
 
 	nonce      uint64       // Needed to prioritize inclusion order within an account
 	costCap    *uint256.Int // Needed to validate cumulative balance sufficiency
@@ -110,18 +137,26 @@ type blobTxMeta struct {
 
 // newBlobTxMeta retrieves the indexed metadata fields from a blob transaction
 // and assembles a helper struct to track in memory.
-func newBlobTxMeta(id uint64, size uint32, tx *types.Transaction) *blobTxMeta {
+// Requires the transaction to have a sidecar (or that we introduce a special version tag for no-sidecar).
+func newBlobTxMeta(id uint64, size uint64, storageSize uint32, tx *types.Transaction) *blobTxMeta {
+	if tx.BlobTxSidecar() == nil {
+		// This should never happen, as the pool only admits blob transactions with a sidecar
+		panic("missing blob tx sidecar")
+	}
 	meta := &blobTxMeta{
-		hash:       tx.Hash(),
-		id:         id,
-		size:       size,
-		nonce:      tx.Nonce(),
-		costCap:    uint256.MustFromBig(tx.Cost()),
-		execTipCap: uint256.MustFromBig(tx.GasTipCap()),
-		execFeeCap: uint256.MustFromBig(tx.GasFeeCap()),
-		blobFeeCap: uint256.MustFromBig(tx.BlobGasFeeCap()),
-		execGas:    tx.Gas(),
-		blobGas:    tx.BlobGas(),
+		hash:        tx.Hash(),
+		vhashes:     tx.BlobHashes(),
+		version:     tx.BlobTxSidecar().Version,
+		id:          id,
+		storageSize: storageSize,
+		size:        size,
+		nonce:       tx.Nonce(),
+		costCap:     uint256.MustFromBig(tx.Cost()),
+		execTipCap:  uint256.MustFromBig(tx.GasTipCap()),
+		execFeeCap:  uint256.MustFromBig(tx.GasFeeCap()),
+		blobFeeCap:  uint256.MustFromBig(tx.BlobGasFeeCap()),
+		execGas:     tx.Gas(),
+		blobGas:     tx.BlobGas(),
 	}
 	meta.basefeeJumps = dynamicFeeJumps(meta.execFeeCap)
 	meta.blobfeeJumps = dynamicFeeJumps(meta.blobFeeCap)
@@ -219,6 +254,11 @@ func newBlobTxMeta(id uint64, size uint32, tx *types.Transaction) *blobTxMeta {
 //     very relaxed ones can be included even if the fees go up, when the closer
 //     ones could already be invalid.
 //
+//   - Because the maximum number of blobs allowed in a block can change per
+//     fork, the pool is designed to handle the maximum number of blobs allowed
+//     in the chain's latest defined fork -- even if it isn't active. This
+//     avoids needing to upgrade the database around the fork boundary.
+//
 // When the pool eventually reaches saturation, some old transactions - that may
 // never execute - will need to be evicted in favor of newer ones. The eviction
 // strategy is quite complex:
@@ -268,7 +308,7 @@ func newBlobTxMeta(id uint64, size uint32, tx *types.Transaction) *blobTxMeta {
 //     going up, crossing the smaller positive jump counter). As such, the pool
 //     cares only about the min of the two delta values for eviction priority.
 //
-//     priority = min(delta-basefee, delta-blobfee)
+//     priority = min(deltaBasefee, deltaBlobfee)
 //
 //   - The above very aggressive dimensionality and noise reduction should result
 //     in transaction being grouped into a small number of buckets, the further
@@ -280,7 +320,7 @@ func newBlobTxMeta(id uint64, size uint32, tx *types.Transaction) *blobTxMeta {
 //     with high fee caps since it could enable pool wars. As such, any positive
 //     priority will be grouped together.
 //
-//     priority = min(delta-basefee, delta-blobfee, 0)
+//     priority = min(deltaBasefee, deltaBlobfee, 0)
 //
 // Optimisation tradeoffs:
 //
@@ -292,21 +332,25 @@ func newBlobTxMeta(id uint64, size uint32, tx *types.Transaction) *blobTxMeta {
 //     minimums will need to be done only starting at the swapped in/out nonce
 //     and leading up to the first no-change.
 type BlobPool struct {
-	config  Config                 // Pool configuration
-	reserve txpool.AddressReserver // Address reserver to ensure exclusivity across subpools
+	config         Config                    // Pool configuration
+	reserver       txpool.Reserver           // Address reserver to ensure exclusivity across subpools
+	hasPendingAuth func(common.Address) bool // Determine whether the specified address has a pending 7702-auth
 
 	store  billy.Database // Persistent data store for the tx metadata and blobs
 	stored uint64         // Useful data size of all transactions on disk
 	limbo  *limbo         // Persistent data store for the non-finalized blobs
 
+	gapped       map[common.Address][]*types.Transaction // Transactions that are currently gapped (nonce too high)
+	gappedSource map[common.Hash]common.Address          // Source of gapped transactions to allow rechecking on inclusion
+
 	signer types.Signer // Transaction signer to use for sender recovery
 	chain  BlockChain   // Chain object to access the state through
 
-	head   *types.Header  // Current head of the chain
-	state  *state.StateDB // Current state at the head of the chain
-	gasTip *uint256.Int   // Currently accepted minimum gas tip
+	head   atomic.Pointer[types.Header] // Current head of the chain
+	state  *state.StateDB               // Current state at the head of the chain
+	gasTip atomic.Pointer[uint256.Int]  // Currently accepted minimum gas tip
 
-	lookup map[common.Hash]uint64           // Lookup table mapping hashes to tx billy entries
+	lookup *lookup                          // Lookup table mapping blobs to txs and txs to billy entries
 	index  map[common.Address][]*blobTxMeta // Blob transactions grouped by accounts, sorted by nonce
 	spent  map[common.Address]*uint256.Int  // Expenditure tracking for individual accounts
 	evict  *evictHeap                       // Heap of cheapest accounts for eviction when full
@@ -319,31 +363,39 @@ type BlobPool struct {
 
 // New creates a new blob transaction pool to gather, sort and filter inbound
 // blob transactions from the network.
-func New(config Config, chain BlockChain) *BlobPool {
+func New(config Config, chain BlockChain, hasPendingAuth func(common.Address) bool) *BlobPool {
 	// Sanitize the input to ensure no vulnerable gas prices are set
 	config = (&config).sanitize()
 
 	// Create the transaction pool with its initial settings
 	return &BlobPool{
-		config: config,
-		signer: types.LatestSigner(chain.Config()),
-		chain:  chain,
-		lookup: make(map[common.Hash]uint64),
-		index:  make(map[common.Address][]*blobTxMeta),
-		spent:  make(map[common.Address]*uint256.Int),
+		config:         config,
+		hasPendingAuth: hasPendingAuth,
+		signer:         types.LatestSigner(chain.Config()),
+		chain:          chain,
+		lookup:         newLookup(),
+		index:          make(map[common.Address][]*blobTxMeta),
+		spent:          make(map[common.Address]*uint256.Int),
+		gapped:         make(map[common.Address][]*types.Transaction),
+		gappedSource:   make(map[common.Hash]common.Address),
 	}
 }
 
 // Filter returns whether the given transaction can be consumed by the blob pool.
 func (p *BlobPool) Filter(tx *types.Transaction) bool {
-	return tx.Type() == types.BlobTxType
+	return p.FilterType(tx.Type())
+}
+
+// FilterType returns whether the blob pool supports the given transaction type.
+func (p *BlobPool) FilterType(kind byte) bool {
+	return kind == types.BlobTxType
 }
 
 // Init sets the gas price needed to keep a transaction in the pool and the chain
 // head to allow balance / nonce checks. The transaction journal will be loaded
 // from disk and filtered based on the provided starting settings.
-func (p *BlobPool) Init(gasTip *big.Int, head *types.Header, reserve txpool.AddressReserver) error {
-	p.reserve = reserve
+func (p *BlobPool) Init(gasTip uint64, head *types.Header, reserver txpool.Reserver) error {
+	p.reserver = reserver
 
 	var (
 		queuedir string
@@ -360,7 +412,7 @@ func (p *BlobPool) Init(gasTip *big.Int, head *types.Header, reserve txpool.Addr
 		}
 	}
 	// Initialize the state with head block, or fallback to empty one in
-	// case the head state is not available(might occur when node is not
+	// case the head state is not available (might occur when node is not
 	// fully synced).
 	state, err := p.chain.StateAt(head.Root)
 	if err != nil {
@@ -369,16 +421,25 @@ func (p *BlobPool) Init(gasTip *big.Int, head *types.Header, reserve txpool.Addr
 	if err != nil {
 		return err
 	}
-	p.head, p.state = head, state
+	p.head.Store(head)
+	p.state = state
 
-	// Index all transactions on disk and delete anything inprocessable
+	// Create new slotter for pre-Osaka blob configuration.
+	slotter := newSlotter(params.BlobTxMaxBlobs)
+
+	// See if we need to migrate the queue blob store after fusaka
+	slotter, err = tryMigrate(p.chain.Config(), slotter, queuedir)
+	if err != nil {
+		return err
+	}
+	// Index all transactions on disk and delete anything unprocessable
 	var fails []uint64
 	index := func(id uint64, size uint32, blob []byte) {
 		if p.parseTransaction(id, size, blob) != nil {
 			fails = append(fails, id)
 		}
 	}
-	store, err := billy.Open(billy.Options{Path: queuedir}, newSlotter(), index)
+	store, err := billy.Open(billy.Options{Path: queuedir, Repair: true}, slotter, index)
 	if err != nil {
 		return err
 	}
@@ -386,6 +447,8 @@ func (p *BlobPool) Init(gasTip *big.Int, head *types.Header, reserve txpool.Addr
 
 	if len(fails) > 0 {
 		log.Warn("Dropping invalidated blob transactions", "ids", fails)
+		dropInvalidMeter.Mark(int64(len(fails)))
+
 		for _, id := range fails {
 			if err := p.store.Delete(id); err != nil {
 				p.Close()
@@ -399,17 +462,17 @@ func (p *BlobPool) Init(gasTip *big.Int, head *types.Header, reserve txpool.Addr
 		p.recheck(addr, nil)
 	}
 	var (
-		basefee = uint256.MustFromBig(eip1559.CalcBaseFee(p.chain.Config(), p.head))
-		blobfee = uint256.MustFromBig(big.NewInt(params.BlobTxMinBlobGasprice))
+		basefee = uint256.MustFromBig(eip1559.CalcBaseFee(p.chain.Config(), head))
+		blobfee = uint256.NewInt(params.BlobTxMinBlobGasprice)
 	)
-	if p.head.ExcessBlobGas != nil {
-		blobfee = uint256.MustFromBig(eip4844.CalcBlobFee(*p.head.ExcessBlobGas))
+	if head.ExcessBlobGas != nil {
+		blobfee = uint256.MustFromBig(eip4844.CalcBlobFee(p.chain.Config(), head))
 	}
-	p.evict = newPriceHeap(basefee, blobfee, &p.index)
+	p.evict = newPriceHeap(basefee, blobfee, p.index)
 
 	// Pool initialized, attach the blob limbo to it to track blobs included
 	// recently but not yet finalized
-	p.limbo, err = newLimbo(limbodir)
+	p.limbo, err = newLimbo(p.chain.Config(), limbodir)
 	if err != nil {
 		p.Close()
 		return err
@@ -418,7 +481,7 @@ func (p *BlobPool) Init(gasTip *big.Int, head *types.Header, reserve txpool.Addr
 	basefeeGauge.Update(int64(basefee.Uint64()))
 	blobfeeGauge.Update(int64(blobfee.Uint64()))
 
-	p.SetGasTip(gasTip)
+	p.SetGasTip(new(big.Int).SetUint64(gasTip))
 
 	// Since the user might have modified their pool's capacity, evict anything
 	// above the current allowance
@@ -434,8 +497,10 @@ func (p *BlobPool) Init(gasTip *big.Int, head *types.Header, reserve txpool.Addr
 // Close closes down the underlying persistent store.
 func (p *BlobPool) Close() error {
 	var errs []error
-	if err := p.limbo.Close(); err != nil {
-		errs = append(errs, err)
+	if p.limbo != nil { // Close might be invoked due to error in constructor, before p,limbo is set
+		if err := p.limbo.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if err := p.store.Close(); err != nil {
 		errs = append(errs, err)
@@ -456,7 +521,7 @@ func (p *BlobPool) parseTransaction(id uint64, size uint32, blob []byte) error {
 	tx := new(types.Transaction)
 	if err := rlp.DecodeBytes(blob, tx); err != nil {
 		// This path is impossible unless the disk data representation changes
-		// across restarts. For that ever unprobable case, recover gracefully
+		// across restarts. For that ever improbable case, recover gracefully
 		// by ignoring this data entry.
 		log.Error("Failed to decode blob pool entry", "id", id, "err", err)
 		return err
@@ -466,18 +531,24 @@ func (p *BlobPool) parseTransaction(id uint64, size uint32, blob []byte) error {
 		return errors.New("missing blob sidecar")
 	}
 
-	meta := newBlobTxMeta(id, size, tx)
-
-	sender, err := p.signer.Sender(tx)
+	meta := newBlobTxMeta(id, tx.Size(), size, tx)
+	if p.lookup.exists(meta.hash) {
+		// This path is only possible after a crash, where deleted items are not
+		// removed via the normal shutdown-startup procedure and thus may get
+		// partially resurrected.
+		log.Error("Rejecting duplicate blob pool entry", "id", id, "hash", tx.Hash())
+		return errors.New("duplicate blob entry")
+	}
+	sender, err := types.Sender(p.signer, tx)
 	if err != nil {
 		// This path is impossible unless the signature validity changes across
-		// restarts. For that ever unprobable case, recover gracefully by ignoring
+		// restarts. For that ever improbable case, recover gracefully by ignoring
 		// this data entry.
 		log.Error("Failed to recover blob tx sender", "id", id, "hash", tx.Hash(), "err", err)
 		return err
 	}
 	if _, ok := p.index[sender]; !ok {
-		if err := p.reserve(sender, true); err != nil {
+		if err := p.reserver.Hold(sender); err != nil {
 			return err
 		}
 		p.index[sender] = []*blobTxMeta{}
@@ -486,9 +557,8 @@ func (p *BlobPool) parseTransaction(id uint64, size uint32, blob []byte) error {
 	p.index[sender] = append(p.index[sender], meta)
 	p.spent[sender] = new(uint256.Int).Add(p.spent[sender], meta.costCap)
 
-	p.lookup[meta.hash] = meta.id
-	p.stored += uint64(meta.size)
-
+	p.lookup.track(meta)
+	p.stored += uint64(meta.storageSize)
 	return nil
 }
 
@@ -520,8 +590,8 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 			ids = append(ids, txs[i].id)
 			nonces = append(nonces, txs[i].nonce)
 
-			p.stored -= uint64(txs[i].size)
-			delete(p.lookup, txs[i].hash)
+			p.stored -= uint64(txs[i].storageSize)
+			p.lookup.untrack(txs[i])
 
 			// Included transactions blobs need to be moved to the limbo
 			if filled && inclusions != nil {
@@ -530,15 +600,17 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 		}
 		delete(p.index, addr)
 		delete(p.spent, addr)
-		if inclusions != nil { // only during reorgs will the heap will be initialized
+		if inclusions != nil { // only during reorgs will the heap be initialized
 			heap.Remove(p.evict, p.evict.index[addr])
 		}
-		p.reserve(addr, false)
+		p.reserver.Release(addr)
 
 		if gapped {
 			log.Warn("Dropping dangling blob transactions", "from", addr, "missing", next, "drop", nonces, "ids", ids)
+			dropDanglingMeter.Mark(int64(len(ids)))
 		} else {
 			log.Trace("Dropping filled blob transactions", "from", addr, "filled", nonces, "ids", ids)
+			dropFilledMeter.Mark(int64(len(ids)))
 		}
 		for _, id := range ids {
 			if err := p.store.Delete(id); err != nil {
@@ -554,13 +626,13 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 			ids    []uint64
 			nonces []uint64
 		)
-		for txs[0].nonce < next {
+		for len(txs) > 0 && txs[0].nonce < next {
 			ids = append(ids, txs[0].id)
 			nonces = append(nonces, txs[0].nonce)
 
 			p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], txs[0].costCap)
-			p.stored -= uint64(txs[0].size)
-			delete(p.lookup, txs[0].hash)
+			p.stored -= uint64(txs[0].storageSize)
+			p.lookup.untrack(txs[0])
 
 			// Included transactions blobs need to be moved to the limbo
 			if inclusions != nil {
@@ -569,6 +641,8 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 			txs = txs[1:]
 		}
 		log.Trace("Dropping overlapped blob transactions", "from", addr, "overlapped", nonces, "ids", ids, "left", len(txs))
+		dropOverlappedMeter.Mark(int64(len(ids)))
+
 		for _, id := range ids {
 			if err := p.store.Delete(id); err != nil {
 				log.Error("Failed to delete blob transaction", "from", addr, "id", id, "err", err)
@@ -583,7 +657,7 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 	txs[0].evictionBlobFeeJumps = txs[0].blobfeeJumps
 
 	for i := 1; i < len(txs); i++ {
-		// If there's no nonce gap, initialize the evicion thresholds as the
+		// If there's no nonce gap, initialize the eviction thresholds as the
 		// minimum between the cumulative thresholds and the current tx fees
 		if txs[i].nonce == txs[i-1].nonce+1 {
 			txs[i].evictionExecTip = txs[i-1].evictionExecTip
@@ -600,10 +674,30 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 			}
 			continue
 		}
-		// Sanity check that there's no double nonce. This case would be a coding
-		// error, but better know about it
+		// Sanity check that there's no double nonce. This case would generally
+		// be a coding error, so better know about it.
+		//
+		// Also, Billy behind the blobpool does not journal deletes. A process
+		// crash would result in previously deleted entities being resurrected.
+		// That could potentially cause a duplicate nonce to appear.
 		if txs[i].nonce == txs[i-1].nonce {
-			log.Error("Duplicate nonce blob transaction", "from", addr, "nonce", txs[i].nonce)
+			id, _ := p.lookup.storeidOfTx(txs[i].hash)
+
+			log.Error("Dropping repeat nonce blob transaction", "from", addr, "nonce", txs[i].nonce, "id", id)
+			dropRepeatedMeter.Mark(1)
+
+			p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], txs[i].costCap)
+			p.stored -= uint64(txs[i].storageSize)
+			p.lookup.untrack(txs[i])
+
+			if err := p.store.Delete(id); err != nil {
+				log.Error("Failed to delete blob transaction", "from", addr, "id", id, "err", err)
+			}
+			txs = append(txs[:i], txs[i+1:]...)
+			p.index[addr] = txs
+
+			i--
+			continue
 		}
 		// Otherwise if there's a nonce gap evict all later transactions
 		var (
@@ -615,12 +709,14 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 			nonces = append(nonces, txs[j].nonce)
 
 			p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], txs[j].costCap)
-			p.stored -= uint64(txs[j].size)
-			delete(p.lookup, txs[j].hash)
+			p.stored -= uint64(txs[j].storageSize)
+			p.lookup.untrack(txs[j])
 		}
 		txs = txs[:i]
 
 		log.Error("Dropping gapped blob transactions", "from", addr, "missing", txs[i-1].nonce+1, "drop", nonces, "ids", ids)
+		dropGappedMeter.Mark(int64(len(ids)))
+
 		for _, id := range ids {
 			if err := p.store.Delete(id); err != nil {
 				log.Error("Failed to delete blob transaction", "from", addr, "id", id, "err", err)
@@ -632,7 +728,7 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 	// Ensure that there's no over-draft, this is expected to happen when some
 	// transactions get included without publishing on the network
 	var (
-		balance = uint256.MustFromBig(p.state.GetBalance(addr))
+		balance = p.state.GetBalance(addr)
 		spent   = p.spent[addr]
 	)
 	if spent.Cmp(balance) > 0 {
@@ -651,20 +747,22 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 			nonces = append(nonces, last.nonce)
 
 			p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], last.costCap)
-			p.stored -= uint64(last.size)
-			delete(p.lookup, last.hash)
+			p.stored -= uint64(last.storageSize)
+			p.lookup.untrack(last)
 		}
 		if len(txs) == 0 {
 			delete(p.index, addr)
 			delete(p.spent, addr)
-			if inclusions != nil { // only during reorgs will the heap will be initialized
+			if inclusions != nil { // only during reorgs will the heap be initialized
 				heap.Remove(p.evict, p.evict.index[addr])
 			}
-			p.reserve(addr, false)
+			p.reserver.Release(addr)
 		} else {
 			p.index[addr] = txs
 		}
 		log.Warn("Dropping overdrafted blob transactions", "from", addr, "balance", balance, "spent", spent, "drop", nonces, "ids", ids)
+		dropOverdraftedMeter.Mark(int64(len(ids)))
+
 		for _, id := range ids {
 			if err := p.store.Delete(id); err != nil {
 				log.Error("Failed to delete blob transaction", "from", addr, "id", id, "err", err)
@@ -689,12 +787,14 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 			nonces = append(nonces, last.nonce)
 
 			p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], last.costCap)
-			p.stored -= uint64(last.size)
-			delete(p.lookup, last.hash)
+			p.stored -= uint64(last.storageSize)
+			p.lookup.untrack(last)
 		}
 		p.index[addr] = txs
 
 		log.Warn("Dropping overcapped blob transactions", "from", addr, "kept", len(txs), "drop", nonces, "ids", ids)
+		dropOvercappedMeter.Mark(int64(len(ids)))
+
 		for _, id := range ids {
 			if err := p.store.Delete(id); err != nil {
 				log.Error("Failed to delete blob transaction", "from", addr, "id", id, "err", err)
@@ -711,7 +811,7 @@ func (p *BlobPool) recheck(addr common.Address, inclusions map[common.Hash]uint6
 // offload removes a tracked blob transaction from the pool and moves it into the
 // limbo for tracking until finality.
 //
-// The method may log errors for various unexpcted scenarios but will not return
+// The method may log errors for various unexpected scenarios but will not return
 // any of it since there's no clear error case. Some errors may be due to coding
 // issues, others caused by signers mining MEV stuff or swapping transactions. In
 // all cases, the pool needs to continue operating.
@@ -738,7 +838,7 @@ func (p *BlobPool) offload(addr common.Address, nonce uint64, id uint64, inclusi
 }
 
 // Reset implements txpool.SubPool, allowing the blob pool's internal state to be
-// kept in sync with the main transacion pool's internal state.
+// kept in sync with the main transaction pool's internal state.
 func (p *BlobPool) Reset(oldHead, newHead *types.Header) {
 	waitStart := time.Now()
 	p.lock.Lock()
@@ -749,12 +849,15 @@ func (p *BlobPool) Reset(oldHead, newHead *types.Header) {
 		resettimeHist.Update(time.Since(start).Nanoseconds())
 	}(time.Now())
 
+	// Handle reorg buffer timeouts evicting old gapped transactions
+	p.evictGapped()
+
 	statedb, err := p.chain.StateAt(newHead.Root)
 	if err != nil {
 		log.Error("Failed to reset blobpool state", "err", err)
 		return
 	}
-	p.head = newHead
+	p.head.Store(newHead)
 	p.state = statedb
 
 	// Run the reorg between the old and new head and figure out which accounts
@@ -769,7 +872,7 @@ func (p *BlobPool) Reset(oldHead, newHead *types.Header) {
 				}
 			}
 			// Recheck the account's pooled transactions to drop included and
-			// invalidated one
+			// invalidated ones
 			p.recheck(addr, inclusions)
 		}
 		if len(adds) > 0 {
@@ -777,7 +880,7 @@ func (p *BlobPool) Reset(oldHead, newHead *types.Header) {
 		}
 	}
 	// Flush out any blobs from limbo that are older than the latest finality
-	if p.chain.Config().IsCancun(p.head.Number, p.head.Time) {
+	if p.chain.Config().IsCancun(newHead.Number, newHead.Time) {
 		p.limbo.finalize(p.chain.CurrentFinalBlock())
 	}
 	// Reset the price heap for the new set of basefee/blobfee pairs
@@ -786,7 +889,7 @@ func (p *BlobPool) Reset(oldHead, newHead *types.Header) {
 		blobfee = uint256.MustFromBig(big.NewInt(params.BlobTxMinBlobGasprice))
 	)
 	if newHead.ExcessBlobGas != nil {
-		blobfee = uint256.MustFromBig(eip4844.CalcBlobFee(*newHead.ExcessBlobGas))
+		blobfee = uint256.MustFromBig(eip4844.CalcBlobFee(p.chain.Config(), newHead))
 	}
 	p.evict.reinit(basefee, blobfee, false)
 
@@ -852,7 +955,7 @@ func (p *BlobPool) reorg(oldHead, newHead *types.Header) (map[common.Address][]*
 	// and accumulate the transactors and transactions
 	for rem.NumberU64() > add.NumberU64() {
 		for _, tx := range rem.Transactions() {
-			from, _ := p.signer.Sender(tx)
+			from, _ := types.Sender(p.signer, tx)
 
 			discarded[from] = append(discarded[from], tx)
 			transactors[from] = struct{}{}
@@ -864,7 +967,7 @@ func (p *BlobPool) reorg(oldHead, newHead *types.Header) (map[common.Address][]*
 	}
 	for add.NumberU64() > rem.NumberU64() {
 		for _, tx := range add.Transactions() {
-			from, _ := p.signer.Sender(tx)
+			from, _ := types.Sender(p.signer, tx)
 
 			included[from] = append(included[from], tx)
 			inclusions[tx.Hash()] = add.NumberU64()
@@ -877,7 +980,7 @@ func (p *BlobPool) reorg(oldHead, newHead *types.Header) (map[common.Address][]*
 	}
 	for rem.Hash() != add.Hash() {
 		for _, tx := range rem.Transactions() {
-			from, _ := p.signer.Sender(tx)
+			from, _ := types.Sender(p.signer, tx)
 
 			discarded[from] = append(discarded[from], tx)
 			transactors[from] = struct{}{}
@@ -887,7 +990,7 @@ func (p *BlobPool) reorg(oldHead, newHead *types.Header) (map[common.Address][]*
 			return nil, nil
 		}
 		for _, tx := range add.Transactions() {
-			from, _ := p.signer.Sender(tx)
+			from, _ := types.Sender(p.signer, tx)
 
 			included[from] = append(included[from], tx)
 			inclusions[tx.Hash()] = add.NumberU64()
@@ -900,7 +1003,7 @@ func (p *BlobPool) reorg(oldHead, newHead *types.Header) (map[common.Address][]*
 	}
 	// Generate the set of transactions per address to pull back into the pool,
 	// also updating the rest along the way
-	reinject := make(map[common.Address][]*types.Transaction)
+	reinject := make(map[common.Address][]*types.Transaction, len(transactors))
 	for addr := range transactors {
 		// Generate the set that was lost to reinject into the pool
 		lost := make([]*types.Transaction, 0, len(discarded[addr]))
@@ -940,6 +1043,21 @@ func (p *BlobPool) reinject(addr common.Address, txhash common.Hash) error {
 	// TODO: seems like an easy optimization here would be getting the serialized tx
 	// from limbo instead of re-serializing it here.
 
+	// Converts reorged-out legacy blob transactions to the new format to prevent
+	// them from becoming stuck in the pool until eviction.
+	//
+	// Performance note: Conversion takes ~140ms (Mac M1 Pro). Since a maximum of
+	// 9 legacy blob transactions are allowed in a block pre-Osaka, an adversary
+	// could theoretically halt a Geth node for ~1.2s by reorging per block. However,
+	// this attack is financially inefficient to execute.
+	head := p.head.Load()
+	if p.chain.Config().IsOsaka(head.Number, head.Time) && tx.BlobTxSidecar().Version == types.BlobSidecarVersion0 {
+		if err := tx.BlobTxSidecar().ToV1(); err != nil {
+			log.Error("Failed to convert the legacy sidecar", "err", err)
+			return err
+		}
+		log.Info("Legacy blob transaction is reorged", "hash", tx.Hash())
+	}
 	// Serialize the transaction back into the primary datastore.
 	blob, err := rlp.EncodeToBytes(tx)
 	if err != nil {
@@ -952,10 +1070,10 @@ func (p *BlobPool) reinject(addr common.Address, txhash common.Hash) error {
 		return err
 	}
 
-	// Update the indixes and metrics
-	meta := newBlobTxMeta(id, p.store.Size(id), tx)
+	// Update the indices and metrics
+	meta := newBlobTxMeta(id, tx.Size(), p.store.Size(id), tx)
 	if _, ok := p.index[addr]; !ok {
-		if err := p.reserve(addr, true); err != nil {
+		if err := p.reserver.Hold(addr); err != nil {
 			log.Warn("Failed to reserve account for blob pool", "tx", tx.Hash(), "from", addr, "err", err)
 			return err
 		}
@@ -966,34 +1084,35 @@ func (p *BlobPool) reinject(addr common.Address, txhash common.Hash) error {
 		p.index[addr] = append(p.index[addr], meta)
 		p.spent[addr] = new(uint256.Int).Add(p.spent[addr], meta.costCap)
 	}
-	p.lookup[meta.hash] = meta.id
-	p.stored += uint64(meta.size)
+	p.lookup.track(meta)
+	p.stored += uint64(meta.storageSize)
 	return nil
 }
 
 // SetGasTip implements txpool.SubPool, allowing the blob pool's gas requirements
-// to be kept in sync with the main transacion pool's gas requirements.
+// to be kept in sync with the main transaction pool's gas requirements.
 func (p *BlobPool) SetGasTip(tip *big.Int) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
 	// Store the new minimum gas tip
-	old := p.gasTip
-	p.gasTip = uint256.MustFromBig(tip)
+	old := p.gasTip.Load()
+	newTip := uint256.MustFromBig(tip)
+	p.gasTip.Store(newTip)
 
 	// If the min miner fee increased, remove transactions below the new threshold
-	if old == nil || p.gasTip.Cmp(old) > 0 {
+	if old == nil || newTip.Cmp(old) > 0 {
 		for addr, txs := range p.index {
 			for i, tx := range txs {
-				if tx.execTipCap.Cmp(p.gasTip) < 0 {
+				if tx.execTipCap.Cmp(newTip) < 0 {
 					// Drop the offending transaction
 					var (
 						ids    = []uint64{tx.id}
 						nonces = []uint64{tx.nonce}
 					)
 					p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], txs[i].costCap)
-					p.stored -= uint64(tx.size)
-					delete(p.lookup, tx.hash)
+					p.stored -= uint64(tx.storageSize)
+					p.lookup.untrack(tx)
 					txs[i] = nil
 
 					// Drop everything afterwards, no gaps allowed
@@ -1002,8 +1121,8 @@ func (p *BlobPool) SetGasTip(tip *big.Int) {
 						nonces = append(nonces, tx.nonce)
 
 						p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], tx.costCap)
-						p.stored -= uint64(tx.size)
-						delete(p.lookup, tx.hash)
+						p.stored -= uint64(tx.storageSize)
+						p.lookup.untrack(tx)
 						txs[i+1+j] = nil
 					}
 					// Clear out the dropped transactions from the index
@@ -1015,10 +1134,12 @@ func (p *BlobPool) SetGasTip(tip *big.Int) {
 						delete(p.spent, addr)
 
 						heap.Remove(p.evict, p.evict.index[addr])
-						p.reserve(addr, false)
+						p.reserver.Release(addr)
 					}
 					// Clear out the transactions from the data store
 					log.Warn("Dropping underpriced blob transaction", "from", addr, "rejected", tx.nonce, "tip", tx.execTipCap, "want", tip, "drop", nonces, "ids", ids)
+					dropUnderpricedMeter.Mark(int64(len(ids)))
+
 					for _, id := range ids {
 						if err := p.store.Delete(id); err != nil {
 							log.Error("Failed to delete dropped transaction", "id", id, "err", err)
@@ -1034,26 +1155,68 @@ func (p *BlobPool) SetGasTip(tip *big.Int) {
 	p.updateStorageMetrics()
 }
 
+// ValidateTxBasics checks whether a transaction is valid according to the consensus
+// rules, but does not check state-dependent validation such as sufficient balance.
+// This check is meant as an early check which only needs to be performed once,
+// and does not require the pool mutex to be held.
+func (p *BlobPool) ValidateTxBasics(tx *types.Transaction) error {
+	opts := &txpool.ValidationOptions{
+		Config:       p.chain.Config(),
+		Accept:       1 << types.BlobTxType,
+		MaxSize:      txMaxSize,
+		MinTip:       p.gasTip.Load().ToBig(),
+		MaxBlobCount: maxBlobsPerTx,
+	}
+	return txpool.ValidateTransaction(tx, p.head.Load(), p.signer, opts)
+}
+
+// checkDelegationLimit determines if the tx sender is delegated or has a
+// pending delegation, and if so, ensures they have at most one in-flight
+// **executable** transaction, e.g. disallow stacked and gapped transactions
+// from the account.
+func (p *BlobPool) checkDelegationLimit(tx *types.Transaction) error {
+	from, _ := types.Sender(p.signer, tx) // validated
+
+	// Short circuit if the sender has neither delegation nor pending delegation.
+	if p.state.GetCodeHash(from) == types.EmptyCodeHash {
+		// Because there is no exclusive lock held between different subpools
+		// when processing transactions, a blob transaction may be accepted
+		// while other SetCode transactions with pending authorities from the
+		// same address are also accepted simultaneously.
+		//
+		// This scenario is considered acceptable, as the rule primarily ensures
+		// that attackers cannot easily and endlessly stack blob transactions
+		// with a delegated or pending delegated sender.
+		if p.hasPendingAuth == nil || !p.hasPendingAuth(from) {
+			return nil
+		}
+	}
+	// Allow a single in-flight pending transaction.
+	pending := p.index[from]
+	if len(pending) == 0 {
+		return nil
+	}
+	// If account already has a pending transaction, allow replacement only.
+	if len(pending) == 1 && pending[0].nonce == tx.Nonce() {
+		return nil
+	}
+	return txpool.ErrInflightTxLimitReached
+}
+
 // validateTx checks whether a transaction is valid according to the consensus
 // rules and adheres to some heuristic limits of the local node (price and size).
+//
+// This function assumes the static validation has been performed already and
+// only runs the stateful checks with lock protection.
 func (p *BlobPool) validateTx(tx *types.Transaction) error {
-	// Ensure the transaction adheres to basic pool filters (type, size, tip) and
-	// consensus rules
-	baseOpts := &txpool.ValidationOptions{
-		Config:  p.chain.Config(),
-		Accept:  1 << types.BlobTxType,
-		MaxSize: txMaxSize,
-		MinTip:  p.gasTip.ToBig(),
-	}
-	if err := txpool.ValidateTransaction(tx, p.head, p.signer, baseOpts); err != nil {
-		return err
-	}
 	// Ensure the transaction adheres to the stateful pool filters (nonce, balance)
 	stateOpts := &txpool.ValidationOptionsWithState{
 		State: p.state,
 
 		FirstNonceGap: func(addr common.Address) uint64 {
-			// Nonce gaps are not permitted in the blob pool, the first gap will
+			// Nonce gaps are permitted in the blob pool, but only as part of the
+			// in-memory 'gapped' buffer. We expose the gap here to validateTx,
+			// then handle the error by adding to the buffer. The first gap will
 			// be the next nonce shifted by however many transactions we already
 			// have pooled.
 			return p.state.GetNonce(addr) + uint64(len(p.index[addr]))
@@ -1074,7 +1237,7 @@ func (p *BlobPool) validateTx(tx *types.Transaction) error {
 		ExistingCost: func(addr common.Address, nonce uint64) *big.Int {
 			next := p.state.GetNonce(addr)
 			if uint64(len(p.index[addr])) > nonce-next {
-				return p.index[addr][int(tx.Nonce()-next)].costCap.ToBig()
+				return p.index[addr][int(nonce-next)].costCap.ToBig()
 			}
 			return nil
 		},
@@ -1082,15 +1245,22 @@ func (p *BlobPool) validateTx(tx *types.Transaction) error {
 	if err := txpool.ValidateTransactionWithState(tx, p.signer, stateOpts); err != nil {
 		return err
 	}
+	if err := p.checkDelegationLimit(tx); err != nil {
+		return err
+	}
 	// If the transaction replaces an existing one, ensure that price bumps are
 	// adhered to.
 	var (
-		from, _ = p.signer.Sender(tx) // already validated above
+		from, _ = types.Sender(p.signer, tx) // already validated above
 		next    = p.state.GetNonce(from)
 	)
 	if uint64(len(p.index[from])) > tx.Nonce()-next {
-		// Account can support the replacement, but the price bump must also be met
 		prev := p.index[from][int(tx.Nonce()-next)]
+		// Ensure the transaction is different than the one tracked locally
+		if prev.hash == tx.Hash() {
+			return txpool.ErrAlreadyKnown
+		}
+		// Account can support the replacement, but the price bump must also be met
 		switch {
 		case tx.GasFeeCapIntCmp(prev.execFeeCap.ToBig()) <= 0:
 			return fmt.Errorf("%w: new tx gas fee cap %v <= %v queued", txpool.ErrReplaceUnderpriced, tx.GasFeeCap(), prev.execFeeCap)
@@ -1109,11 +1279,11 @@ func (p *BlobPool) validateTx(tx *types.Transaction) error {
 		)
 		switch {
 		case tx.GasFeeCapIntCmp(minGasFeeCap.ToBig()) < 0:
-			return fmt.Errorf("%w: new tx gas fee cap %v <= %v queued + %d%% replacement penalty", txpool.ErrReplaceUnderpriced, tx.GasFeeCap(), prev.execFeeCap, p.config.PriceBump)
+			return fmt.Errorf("%w: new tx gas fee cap %v < %v queued + %d%% replacement penalty", txpool.ErrReplaceUnderpriced, tx.GasFeeCap(), prev.execFeeCap, p.config.PriceBump)
 		case tx.GasTipCapIntCmp(minGasTipCap.ToBig()) < 0:
-			return fmt.Errorf("%w: new tx gas tip cap %v <= %v queued + %d%% replacement penalty", txpool.ErrReplaceUnderpriced, tx.GasTipCap(), prev.execTipCap, p.config.PriceBump)
+			return fmt.Errorf("%w: new tx gas tip cap %v < %v queued + %d%% replacement penalty", txpool.ErrReplaceUnderpriced, tx.GasTipCap(), prev.execTipCap, p.config.PriceBump)
 		case tx.BlobGasFeeCapIntCmp(minBlobGasFeeCap.ToBig()) < 0:
-			return fmt.Errorf("%w: new tx blob gas fee cap %v <= %v queued + %d%% replacement penalty", txpool.ErrReplaceUnderpriced, tx.BlobGasFeeCap(), prev.blobFeeCap, p.config.PriceBump)
+			return fmt.Errorf("%w: new tx blob gas fee cap %v < %v queued + %d%% replacement penalty", txpool.ErrReplaceUnderpriced, tx.BlobGasFeeCap(), prev.blobFeeCap, p.config.PriceBump)
 		}
 	}
 	return nil
@@ -1125,12 +1295,12 @@ func (p *BlobPool) Has(hash common.Hash) bool {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
-	_, ok := p.lookup[hash]
-	return ok
+	poolHas := p.lookup.exists(hash)
+	_, gapped := p.gappedSource[hash]
+	return poolHas || gapped
 }
 
-// Get returns a transaction if it is contained in the pool, or nil otherwise.
-func (p *BlobPool) Get(hash common.Hash) *types.Transaction {
+func (p *BlobPool) getRLP(hash common.Hash) []byte {
 	// Track the amount of time waiting to retrieve a fully resolved blob tx from
 	// the pool and the amount of time actually spent on pulling the data from disk.
 	getStart := time.Now()
@@ -1143,7 +1313,7 @@ func (p *BlobPool) Get(hash common.Hash) *types.Transaction {
 	}(time.Now())
 
 	// Pull the blob from disk and return an assembled response
-	id, ok := p.lookup[hash]
+	id, ok := p.lookup.storeidOfTx(hash)
 	if !ok {
 		return nil
 	}
@@ -1152,39 +1322,180 @@ func (p *BlobPool) Get(hash common.Hash) *types.Transaction {
 		log.Error("Tracked blob transaction missing from store", "hash", hash, "id", id, "err", err)
 		return nil
 	}
+	return data
+}
+
+// Get returns a transaction if it is contained in the pool, or nil otherwise.
+func (p *BlobPool) Get(hash common.Hash) *types.Transaction {
+	data := p.getRLP(hash)
+	if len(data) == 0 {
+		return nil
+	}
 	item := new(types.Transaction)
-	if err = rlp.DecodeBytes(data, item); err != nil {
-		log.Error("Blobs corrupted for traced transaction", "hash", hash, "id", id, "err", err)
+	if err := rlp.DecodeBytes(data, item); err != nil {
+		id, _ := p.lookup.storeidOfTx(hash)
+
+		log.Error("Blobs corrupted for traced transaction",
+			"hash", hash, "id", id, "err", err)
 		return nil
 	}
 	return item
 }
 
-// Add inserts a set of blob transactions into the pool if they pass validation (both
-// consensus validity and pool restictions).
-func (p *BlobPool) Add(txs []*types.Transaction, local bool, sync bool) []error {
+// GetRLP returns a RLP-encoded transaction if it is contained in the pool.
+func (p *BlobPool) GetRLP(hash common.Hash) []byte {
+	return p.getRLP(hash)
+}
+
+// GetMetadata returns the transaction type and transaction size with the
+// given transaction hash.
+//
+// The size refers the length of the 'rlp encoding' of a blob transaction
+// including the attached blobs.
+func (p *BlobPool) GetMetadata(hash common.Hash) *txpool.TxMetadata {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+
+	size, ok := p.lookup.sizeOfTx(hash)
+	if !ok {
+		return nil
+	}
+	return &txpool.TxMetadata{
+		Type: types.BlobTxType,
+		Size: size,
+	}
+}
+
+// GetBlobs returns a number of blobs and proofs for the given versioned hashes.
+// Blobpool must place responses in the order given in the request, using null
+// for any missing blobs.
+//
+// For instance, if the request is [A_versioned_hash, B_versioned_hash,
+// C_versioned_hash] and blobpool has data for blobs A and C, but doesn't have
+// data for B, the response MUST be [A, null, C].
+//
+// This is a utility method for the engine API, enabling consensus clients to
+// retrieve blobs from the pools directly instead of the network.
+//
+// The version argument specifies the type of proofs to return, either the
+// blob proofs (version 0) or the cell proofs (version 1). Proofs conversion is
+// CPU intensive and prohibited in the blobpool explicitly.
+func (p *BlobPool) GetBlobs(vhashes []common.Hash, version byte) ([]*kzg4844.Blob, []kzg4844.Commitment, [][]kzg4844.Proof, error) {
 	var (
-		adds = make([]*types.Transaction, 0, len(txs))
-		errs = make([]error, len(txs))
+		blobs       = make([]*kzg4844.Blob, len(vhashes))
+		commitments = make([]kzg4844.Commitment, len(vhashes))
+		proofs      = make([][]kzg4844.Proof, len(vhashes))
+
+		indices = make(map[common.Hash][]int)
+		filled  = make(map[common.Hash]struct{})
 	)
-	for i, tx := range txs {
-		errs[i] = p.add(tx)
-		if errs[i] == nil {
-			adds = append(adds, tx.WithoutBlobTxSidecar())
+	for i, h := range vhashes {
+		indices[h] = append(indices[h], i)
+	}
+
+	for _, vhash := range vhashes {
+		if _, ok := filled[vhash]; ok {
+			// Skip vhash that was already resolved in a previous iteration
+			continue
+		}
+
+		// Retrieve the corresponding blob tx with the vhash.
+		p.lock.RLock()
+		txID, exists := p.lookup.storeidOfBlob(vhash)
+		p.lock.RUnlock()
+		if !exists {
+			continue
+		}
+		data, err := p.store.Get(txID)
+		if err != nil {
+			log.Error("Tracked blob transaction missing from store", "id", txID, "err", err)
+			continue
+		}
+
+		// Decode the blob transaction
+		tx := new(types.Transaction)
+		if err := rlp.DecodeBytes(data, tx); err != nil {
+			log.Error("Blobs corrupted for traced transaction", "id", txID, "err", err)
+			continue
+		}
+		sidecar := tx.BlobTxSidecar()
+		if sidecar == nil {
+			log.Error("Blob tx without sidecar", "hash", tx.Hash(), "id", txID)
+			continue
+		}
+		// Traverse the blobs in the transaction
+		for i, hash := range tx.BlobHashes() {
+			list, ok := indices[hash]
+			if !ok {
+				continue // non-interesting blob
+			}
+			// Mark hash as seen.
+			filled[hash] = struct{}{}
+			if sidecar.Version != version {
+				// Skip blobs with incompatible version. Note we still track the blob hash
+				// in `filled` here, ensuring that we do not resolve this tx another time.
+				continue
+			}
+			// Get or convert the proof.
+			var pf []kzg4844.Proof
+			switch version {
+			case types.BlobSidecarVersion0:
+				pf = []kzg4844.Proof{sidecar.Proofs[i]}
+			case types.BlobSidecarVersion1:
+				cellProofs, err := sidecar.CellProofsAt(i)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				pf = cellProofs
+			}
+			for _, index := range list {
+				blobs[index] = &sidecar.Blobs[i]
+				commitments[index] = sidecar.Commitments[i]
+				proofs[index] = pf
+			}
 		}
 	}
-	if len(adds) > 0 {
-		p.discoverFeed.Send(core.NewTxsEvent{Txs: adds})
-		p.insertFeed.Send(core.NewTxsEvent{Txs: adds})
+	return blobs, commitments, proofs, nil
+}
+
+// AvailableBlobs returns the number of blobs that are available in the subpool.
+func (p *BlobPool) AvailableBlobs(vhashes []common.Hash) int {
+	available := 0
+	for _, vhash := range vhashes {
+		// Retrieve the datastore item (in a short lock)
+		p.lock.RLock()
+		_, exists := p.lookup.storeidOfBlob(vhash)
+		p.lock.RUnlock()
+		if exists {
+			available++
+		}
+	}
+	return available
+}
+
+// Add inserts a set of blob transactions into the pool if they pass validation (both
+// consensus validity and pool restrictions).
+func (p *BlobPool) Add(txs []*types.Transaction, sync bool) []error {
+	var (
+		errs = make([]error, len(txs))
+		adds = make([]*types.Transaction, 0, len(txs))
+	)
+	for i, tx := range txs {
+		if errs[i] = p.ValidateTxBasics(tx); errs[i] != nil {
+			continue
+		}
+		if errs[i] = p.add(tx); errs[i] == nil {
+			adds = append(adds, tx.WithoutBlobTxSidecar())
+		}
 	}
 	return errs
 }
 
-// Add inserts a new blob transaction into the pool if it passes validation (both
-// consensus validity and pool restictions).
+// add inserts a new blob transaction into the pool if it passes validation (both
+// consensus validity and pool restrictions).
 func (p *BlobPool) add(tx *types.Transaction) (err error) {
 	// The blob pool blocks on adding a transaction. This is because blob txs are
-	// only even pulled form the network, so this method will act as the overload
+	// only even pulled from the network, so this method will act as the overload
 	// protection for fetches.
 	waitStart := time.Now()
 	p.lock.Lock()
@@ -1195,16 +1506,57 @@ func (p *BlobPool) add(tx *types.Transaction) (err error) {
 		addtimeHist.Update(time.Since(start).Nanoseconds())
 	}(time.Now())
 
+	return p.addLocked(tx, true)
+}
+
+// addLocked inserts a new blob transaction into the pool if it passes validation (both
+// consensus validity and pool restrictions). It must be called with the pool lock held.
+// Only for internal use.
+func (p *BlobPool) addLocked(tx *types.Transaction, checkGapped bool) (err error) {
 	// Ensure the transaction is valid from all perspectives
 	if err := p.validateTx(tx); err != nil {
 		log.Trace("Transaction validation failed", "hash", tx.Hash(), "err", err)
+		switch {
+		case errors.Is(err, txpool.ErrUnderpriced):
+			addUnderpricedMeter.Mark(1)
+		case errors.Is(err, txpool.ErrTxGasPriceTooLow):
+			addUnderpricedMeter.Mark(1)
+		case errors.Is(err, core.ErrNonceTooLow):
+			addStaleMeter.Mark(1)
+		case errors.Is(err, core.ErrNonceTooHigh):
+			addGappedMeter.Mark(1)
+			// Store the tx in memory, and revalidate later
+			from, _ := types.Sender(p.signer, tx)
+			allowance := p.gappedAllowance(from)
+			if allowance >= 1 && len(p.gapped) < maxGapped {
+				p.gapped[from] = append(p.gapped[from], tx)
+				p.gappedSource[tx.Hash()] = from
+				log.Trace("added tx to gapped blob queue", "allowance", allowance, "hash", tx.Hash(), "from", from, "nonce", tx.Nonce(), "qlen", len(p.gapped[from]))
+				return nil
+			} else {
+				// if maxGapped is reached, it is better to give time to gapped
+				// transactions by keeping the old and dropping this one.
+				// Thus replacing a gapped transaction with another gapped transaction
+				// is discouraged.
+				log.Trace("no gapped blob queue allowance", "allowance", allowance, "hash", tx.Hash(), "from", from, "nonce", tx.Nonce(), "qlen", len(p.gapped[from]))
+			}
+		case errors.Is(err, core.ErrInsufficientFunds):
+			addOverdraftedMeter.Mark(1)
+		case errors.Is(err, txpool.ErrAccountLimitExceeded):
+			addOvercappedMeter.Mark(1)
+		case errors.Is(err, txpool.ErrReplaceUnderpriced):
+			addNoreplaceMeter.Mark(1)
+		default:
+			addInvalidMeter.Mark(1)
+		}
 		return err
 	}
 	// If the address is not yet known, request exclusivity to track the account
 	// only by this subpool until all transactions are evicted
 	from, _ := types.Sender(p.signer, tx) // already validated above
 	if _, ok := p.index[from]; !ok {
-		if err := p.reserve(from, true); err != nil {
+		if err := p.reserver.Hold(from); err != nil {
+			addNonExclusiveMeter.Mark(1)
 			return err
 		}
 		defer func() {
@@ -1215,7 +1567,7 @@ func (p *BlobPool) add(tx *types.Transaction) (err error) {
 			// by a return statement before running deferred methods. Take care with
 			// removing or subscoping err as it will break this clause.
 			if err != nil {
-				p.reserve(from, false)
+				p.reserver.Release(from)
 			}
 		}()
 	}
@@ -1230,7 +1582,7 @@ func (p *BlobPool) add(tx *types.Transaction) (err error) {
 	if err != nil {
 		return err
 	}
-	meta := newBlobTxMeta(id, p.store.Size(id), tx)
+	meta := newBlobTxMeta(id, tx.Size(), p.store.Size(id), tx)
 
 	var (
 		next   = p.state.GetNonce(from)
@@ -1244,6 +1596,8 @@ func (p *BlobPool) add(tx *types.Transaction) (err error) {
 	}
 	if len(p.index[from]) > offset {
 		// Transaction replaces a previously queued one
+		dropReplacedMeter.Mark(1)
+
 		prev := p.index[from][offset]
 		if err := p.store.Delete(prev.id); err != nil {
 			// Shitty situation, but try to recover gracefully instead of going boom
@@ -1254,9 +1608,9 @@ func (p *BlobPool) add(tx *types.Transaction) (err error) {
 		p.spent[from] = new(uint256.Int).Sub(p.spent[from], prev.costCap)
 		p.spent[from] = new(uint256.Int).Add(p.spent[from], meta.costCap)
 
-		delete(p.lookup, prev.hash)
-		p.lookup[meta.hash] = meta.id
-		p.stored += uint64(meta.size) - uint64(prev.size)
+		p.lookup.untrack(prev)
+		p.lookup.track(meta)
+		p.stored += uint64(meta.storageSize) - uint64(prev.storageSize)
 	} else {
 		// Transaction extends previously scheduled ones
 		p.index[from] = append(p.index[from], meta)
@@ -1265,8 +1619,8 @@ func (p *BlobPool) add(tx *types.Transaction) (err error) {
 			newacc = true
 		}
 		p.spent[from] = new(uint256.Int).Add(p.spent[from], meta.costCap)
-		p.lookup[meta.hash] = meta.id
-		p.stored += uint64(meta.size)
+		p.lookup.track(meta)
+		p.stored += uint64(meta.storageSize)
 	}
 	// Recompute the rolling eviction fields. In case of a replacement, this will
 	// recompute all subsequent fields. In case of an append, this will only do
@@ -1322,6 +1676,59 @@ func (p *BlobPool) add(tx *types.Transaction) (err error) {
 	}
 	p.updateStorageMetrics()
 
+	addValidMeter.Mark(1)
+
+	// Notify all listeners of the new arrival
+	p.discoverFeed.Send(core.NewTxsEvent{Txs: []*types.Transaction{tx.WithoutBlobTxSidecar()}})
+	p.insertFeed.Send(core.NewTxsEvent{Txs: []*types.Transaction{tx.WithoutBlobTxSidecar()}})
+
+	//check the gapped queue for this account and try to promote
+	if gtxs, ok := p.gapped[from]; checkGapped && ok && len(gtxs) > 0 {
+		// We have to add in nonce order, but we want to stable sort to cater for situations
+		// where transactions are replaced, keeping the original receive order for same nonce
+		sort.SliceStable(gtxs, func(i, j int) bool {
+			return gtxs[i].Nonce() < gtxs[j].Nonce()
+		})
+		for len(gtxs) > 0 {
+			stateNonce := p.state.GetNonce(from)
+			firstgap := stateNonce + uint64(len(p.index[from]))
+
+			if gtxs[0].Nonce() > firstgap {
+				// Anything beyond the first gap is not addable yet
+				break
+			}
+
+			// Drop any buffered transactions that became stale in the meantime (included in chain or replaced)
+			// If we arrive to the transaction in the pending range (between the state Nonce and first gap, we
+			// try to add them now while removing from here.
+			tx := gtxs[0]
+			gtxs[0] = nil
+			gtxs = gtxs[1:]
+			delete(p.gappedSource, tx.Hash())
+
+			if tx.Nonce() < stateNonce {
+				// Stale, drop it. Eventually we could add to limbo here if hash matches.
+				log.Trace("Gapped blob transaction became stale", "hash", tx.Hash(), "from", from, "nonce", tx.Nonce(), "state", stateNonce, "qlen", len(p.gapped[from]))
+				continue
+			}
+
+			if tx.Nonce() <= firstgap {
+				// If we hit the pending range, including the first gap, add it and continue to try to add more.
+				// We do not recurse here, but continue to loop instead.
+				// We are under lock, so we can add the transaction directly.
+				if err := p.addLocked(tx, false); err == nil {
+					log.Trace("Gapped blob transaction added to pool", "hash", tx.Hash(), "from", from, "nonce", tx.Nonce(), "qlen", len(p.gapped[from]))
+				} else {
+					log.Trace("Gapped blob transaction not accepted", "hash", tx.Hash(), "from", from, "nonce", tx.Nonce(), "err", err)
+				}
+			}
+		}
+		if len(gtxs) == 0 {
+			delete(p.gapped, from)
+		} else {
+			p.gapped[from] = gtxs
+		}
+	}
 	return nil
 }
 
@@ -1344,7 +1751,7 @@ func (p *BlobPool) drop() {
 	if last {
 		delete(p.index, from)
 		delete(p.spent, from)
-		p.reserve(from, false)
+		p.reserver.Release(from)
 	} else {
 		txs[len(txs)-1] = nil
 		txs = txs[:len(txs)-1]
@@ -1352,10 +1759,10 @@ func (p *BlobPool) drop() {
 		p.index[from] = txs
 		p.spent[from] = new(uint256.Int).Sub(p.spent[from], drop.costCap)
 	}
-	p.stored -= uint64(drop.size)
-	delete(p.lookup, drop.hash)
+	p.stored -= uint64(drop.storageSize)
+	p.lookup.untrack(drop)
 
-	// Remove the transaction from the pool's evicion heap:
+	// Remove the transaction from the pool's eviction heap:
 	//   - If the entire account was dropped, pop off the address
 	//   - Otherwise, if the new tail has better eviction caps, fix the heap
 	if last {
@@ -1371,7 +1778,9 @@ func (p *BlobPool) drop() {
 		}
 	}
 	// Remove the transaction from the data store
-	log.Warn("Evicting overflown blob transaction", "from", from, "evicted", drop.nonce, "id", drop.id)
+	log.Debug("Evicting overflown blob transaction", "from", from, "evicted", drop.nonce, "id", drop.id)
+	dropOverflownMeter.Mark(1)
+
 	if err := p.store.Delete(drop.id); err != nil {
 		log.Error("Failed to drop evicted transaction", "id", drop.id, "err", err)
 	}
@@ -1379,7 +1788,15 @@ func (p *BlobPool) drop() {
 
 // Pending retrieves all currently processable transactions, grouped by origin
 // account and sorted by nonce.
-func (p *BlobPool) Pending(enforceTips bool) map[common.Address][]*txpool.LazyTransaction {
+//
+// The transactions can also be pre-filtered by the dynamic fee components to
+// reduce allocations and load on downstream subsystems.
+func (p *BlobPool) Pending(filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
+	// If only plain transactions are requested, this pool is unsuitable as it
+	// contains none, don't even bother.
+	if !filter.BlobTxs {
+		return nil
+	}
 	// Track the amount of time waiting to retrieve the list of pending blob txs
 	// from the pool and the amount of time actually spent on assembling the data.
 	// The latter will be pretty much moot, but we've kept it to have symmetric
@@ -1389,20 +1806,50 @@ func (p *BlobPool) Pending(enforceTips bool) map[common.Address][]*txpool.LazyTr
 	pendwaitHist.Update(time.Since(pendStart).Nanoseconds())
 	defer p.lock.RUnlock()
 
-	defer func(start time.Time) {
-		pendtimeHist.Update(time.Since(start).Nanoseconds())
-	}(time.Now())
+	execStart := time.Now()
+	defer func() {
+		pendtimeHist.Update(time.Since(execStart).Nanoseconds())
+	}()
 
-	pending := make(map[common.Address][]*txpool.LazyTransaction)
+	pending := make(map[common.Address][]*txpool.LazyTransaction, len(p.index))
 	for addr, txs := range p.index {
-		var lazies []*txpool.LazyTransaction
+		lazies := make([]*txpool.LazyTransaction, 0, len(txs))
 		for _, tx := range txs {
+			// Skip v0 or v1 blob transactions depending on the filter
+			if tx.version != filter.BlobVersion {
+				break // skip the rest because of nonce ordering
+			}
+
+			// If transaction filtering was requested, discard badly priced ones
+			if filter.MinTip != nil && filter.BaseFee != nil {
+				if tx.execFeeCap.Lt(filter.BaseFee) {
+					break // basefee too low, cannot be included, discard rest of txs from the account
+				}
+				tip := new(uint256.Int).Sub(tx.execFeeCap, filter.BaseFee)
+				if tip.Gt(tx.execTipCap) {
+					tip = tx.execTipCap
+				}
+				if tip.Lt(filter.MinTip) {
+					break // allowed or remaining tip too low, cannot be included, discard rest of txs from the account
+				}
+			}
+			if filter.BlobFee != nil {
+				if tx.blobFeeCap.Lt(filter.BlobFee) {
+					break // blobfee too low, cannot be included, discard rest of txs from the account
+				}
+			}
+			if filter.GasLimitCap != 0 {
+				if tx.execGas > filter.GasLimitCap {
+					break // execution gas limit is too high
+				}
+			}
+			// Transaction was accepted according to the filter, append to the pending list
 			lazies = append(lazies, &txpool.LazyTransaction{
 				Pool:      p,
 				Hash:      tx.hash,
-				Time:      time.Now(), // TODO(karalabe): Maybe save these and use that?
-				GasFeeCap: tx.execFeeCap.ToBig(),
-				GasTipCap: tx.execTipCap.ToBig(),
+				Time:      execStart, // TODO(karalabe): Maybe save these and use that?
+				GasFeeCap: tx.execFeeCap,
+				GasTipCap: tx.execTipCap,
 				Gas:       tx.execGas,
 				BlobGas:   tx.blobGas,
 			})
@@ -1442,7 +1889,8 @@ func (p *BlobPool) updateStorageMetrics() {
 		metrics.GetOrRegisterGauge(fmt.Sprintf(shelfSlotusedGaugeName, shelf.SlotSize/blobSize), nil).Update(int64(shelf.FilledSlots))
 		metrics.GetOrRegisterGauge(fmt.Sprintf(shelfSlotgapsGaugeName, shelf.SlotSize/blobSize), nil).Update(int64(shelf.GappedSlots))
 
-		if shelf.SlotSize/blobSize > maxBlobsPerTransaction {
+		maxBlobs := eip4844.LatestMaxBlobsPerBlock(p.chain.Config())
+		if shelf.SlotSize/blobSize > uint32(maxBlobs) {
 			oversizedDataused += slotDataused
 			oversizedDatagaps += slotDatagaps
 			oversizedSlotused += shelf.FilledSlots
@@ -1462,7 +1910,7 @@ func (p *BlobPool) updateStorageMetrics() {
 }
 
 // updateLimboMetrics retrieves a bunch of stats from the limbo store and pushes
-// // them out as metrics.
+// them out as metrics.
 func (p *BlobPool) updateLimboMetrics() {
 	stats := p.limbo.store.Infos()
 
@@ -1502,6 +1950,7 @@ func (p *BlobPool) SubscribeTransactions(ch chan<- core.NewTxsEvent, reorgs bool
 // Nonce returns the next nonce of an account, with all transactions executable
 // by the pool already applied on top.
 func (p *BlobPool) Nonce(addr common.Address) uint64 {
+	// We need a write lock here, since state.GetNonce might write the cache.
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -1511,11 +1960,55 @@ func (p *BlobPool) Nonce(addr common.Address) uint64 {
 	return p.state.GetNonce(addr)
 }
 
+// gappedAllowance returns the number of gapped transactions still
+// allowed for the given account. Allowance is based on a slow-start
+// logic, allowing more gaps (resource usage) to accounts with a
+// higher nonce. Can also return negative values.
+func (p *BlobPool) gappedAllowance(addr common.Address) int {
+	// Gaps happen, but we don't want to allow too many.
+	// Use log10(nonce+1) as the allowance, with a minimum of 0.
+	nonce := p.state.GetNonce(addr)
+	allowance := int(math.Log10(float64(nonce + 1)))
+	// Cap the allowance to the remaining pool space
+	return min(allowance, maxTxsPerAccount-len(p.index[addr])) - len(p.gapped[addr])
+}
+
+// evictGapped removes the old transactions from the gapped reorder buffer.
+// Concurrency: The caller must hold the pool lock before calling this function.
+func (p *BlobPool) evictGapped() {
+	cutoff := time.Now().Add(-gappedLifetime)
+	for from, txs := range p.gapped {
+		nonce := p.state.GetNonce(from)
+		// Reuse the original slice to avoid extra allocations.
+		// This is safe because we only keep references to the original gappedTx objects,
+		// and we overwrite the slice for this account after filtering.
+		keep := txs[:0]
+		for i, gtx := range txs {
+			if gtx.Time().Before(cutoff) || gtx.Nonce() < nonce {
+				// Evict old or stale transactions
+				// Should we add stale to limbo here if it would belong?
+				delete(p.gappedSource, gtx.Hash())
+				txs[i] = nil // Explicitly nil out evicted element
+			} else {
+				keep = append(keep, gtx)
+			}
+		}
+		if len(keep) < len(txs) {
+			log.Trace("Evicting old gapped blob transactions", "count", len(txs)-len(keep), "from", from)
+		}
+		if len(keep) == 0 {
+			delete(p.gapped, from)
+		} else {
+			p.gapped[from] = keep
+		}
+	}
+}
+
 // Stats retrieves the current pool stats, namely the number of pending and the
 // number of queued (non-executable) transactions.
 func (p *BlobPool) Stats() (int, int) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 
 	var pending int
 	for _, txs := range p.index {
@@ -1542,18 +2035,75 @@ func (p *BlobPool) ContentFrom(addr common.Address) ([]*types.Transaction, []*ty
 	return []*types.Transaction{}, []*types.Transaction{}
 }
 
-// Locals retrieves the accounts currently considered local by the pool.
-//
-// There is no notion of local accounts in the blob pool.
-func (p *BlobPool) Locals() []common.Address {
-	return []common.Address{}
-}
-
 // Status returns the known status (unknown/pending/queued) of a transaction
 // identified by their hashes.
 func (p *BlobPool) Status(hash common.Hash) txpool.TxStatus {
-	if p.Has(hash) {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+
+	if p.lookup.exists(hash) {
 		return txpool.TxStatusPending
 	}
+	if _, gapped := p.gappedSource[hash]; gapped {
+		return txpool.TxStatusQueued
+	}
 	return txpool.TxStatusUnknown
+}
+
+// Clear implements txpool.SubPool, removing all tracked transactions
+// from the blob pool and persistent store.
+//
+// Note, do not use this in production / live code. In live code, the pool is
+// meant to reset on a separate thread to avoid DoS vectors.
+func (p *BlobPool) Clear() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	// manually iterating and deleting every entry is super sub-optimal
+	// However, Clear is not currently used in production so
+	// performance is not critical at the moment.
+	for hash := range p.lookup.txIndex {
+		id, _ := p.lookup.storeidOfTx(hash)
+		if err := p.store.Delete(id); err != nil {
+			log.Warn("failed to delete blob tx from backing store", "err", err)
+		}
+	}
+	for hash := range p.lookup.blobIndex {
+		id, _ := p.lookup.storeidOfBlob(hash)
+		if err := p.store.Delete(id); err != nil {
+			log.Warn("failed to delete blob from backing store", "err", err)
+		}
+	}
+
+	// unreserve each tracked account.  Ideally, we could just clear the
+	// reservation map in the parent txpool context.  However, if we clear in
+	// parent context, to avoid exposing the subpool lock, we have to lock the
+	// reservations and then lock each subpool.
+	//
+	// This creates the potential for a deadlock situation:
+	//
+	// * TxPool.Clear locks the reservations
+	// * a new transaction is received which locks the subpool mutex
+	// * TxPool.Clear attempts to lock subpool mutex
+	//
+	// The transaction addition may attempt to reserve the sender addr which
+	// can't happen until Clear releases the reservation lock.  Clear cannot
+	// acquire the subpool lock until the transaction addition is completed.
+	for acct := range p.index {
+		p.reserver.Release(acct)
+	}
+	p.lookup = newLookup()
+	p.index = make(map[common.Address][]*blobTxMeta)
+	p.spent = make(map[common.Address]*uint256.Int)
+
+	// Reset counters and the gapped buffer
+	p.stored = 0
+	p.gapped = make(map[common.Address][]*types.Transaction)
+	p.gappedSource = make(map[common.Hash]common.Address)
+
+	var (
+		basefee = uint256.MustFromBig(eip1559.CalcBaseFee(p.chain.Config(), p.head.Load()))
+		blobfee = uint256.NewInt(params.BlobTxMinBlobGasprice)
+	)
+	p.evict = newPriceHeap(basefee, blobfee, p.index)
 }

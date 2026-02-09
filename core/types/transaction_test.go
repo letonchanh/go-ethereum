@@ -22,13 +22,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
 	"reflect"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/holiman/uint256"
 )
 
 // The values in those tests are from the Transaction Tests
@@ -344,6 +347,41 @@ func TestTransactionCoding(t *testing.T) {
 	}
 }
 
+func TestLegacyTransaction_ConsistentV_LargeChainIds(t *testing.T) {
+	chainId := new(big.Int).SetUint64(13317435930671861669)
+
+	txdata := &LegacyTx{
+		Nonce:    1,
+		Gas:      1,
+		GasPrice: big.NewInt(2),
+		Data:     []byte("abcdef"),
+	}
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("could not generate key: %v", err)
+	}
+
+	tx, err := SignNewTx(key, NewEIP2930Signer(chainId), txdata)
+	if err != nil {
+		t.Fatalf("could not sign transaction: %v", err)
+	}
+
+	// Make a copy of the initial V value
+	preV, _, _ := tx.RawSignatureValues()
+	preV = new(big.Int).Set(preV)
+
+	if tx.ChainId().Cmp(chainId) != 0 {
+		t.Fatalf("wrong chain id: %v", tx.ChainId())
+	}
+
+	v, _, _ := tx.RawSignatureValues()
+
+	if v.Cmp(preV) != 0 {
+		t.Fatalf("wrong v value: %v", v)
+	}
+}
+
 func encodeDecodeJSON(tx *Transaction) (*Transaction, error) {
 	data, err := json.Marshal(tx)
 	if err != nil {
@@ -378,7 +416,7 @@ func assertEqual(orig *Transaction, cpy *Transaction) error {
 	}
 	if orig.AccessList() != nil {
 		if !reflect.DeepEqual(orig.AccessList(), cpy.AccessList()) {
-			return errors.New("access list wrong!")
+			return errors.New("access list wrong")
 		}
 	}
 	return nil
@@ -450,4 +488,249 @@ func TestTransactionSizes(t *testing.T) {
 			t.Errorf("test %d: (unmarshalled) size wrong, have %d want %d", i, have, want)
 		}
 	}
+}
+
+func TestYParityJSONUnmarshalling(t *testing.T) {
+	baseJson := map[string]interface{}{
+		// type is filled in by the test
+		"chainId":              "0x7",
+		"nonce":                "0x0",
+		"to":                   "0x1b442286e32ddcaa6e2570ce9ed85f4b4fc87425",
+		"gas":                  "0x124f8",
+		"gasPrice":             "0x693d4ca8",
+		"maxPriorityFeePerGas": "0x3b9aca00",
+		"maxFeePerGas":         "0x6fc23ac00",
+		"maxFeePerBlobGas":     "0x3b9aca00",
+		"value":                "0x0",
+		"input":                "0x",
+		"accessList":           []interface{}{},
+		"blobVersionedHashes": []string{
+			"0x010657f37554c781402a22917dee2f75def7ab966d7b770905398eba3c444014",
+		},
+
+		// v and yParity are filled in by the test
+		"r": "0x2a922afc784d07e98012da29f2f37cae1f73eda78aa8805d3df6ee5dbb41ec1",
+		"s": "0x4f1f75ae6bcdf4970b4f305da1a15d8c5ddb21f555444beab77c9af2baab14",
+	}
+
+	tests := []struct {
+		name    string
+		v       string
+		yParity string
+		wantErr error
+	}{
+		// Valid v and yParity
+		{"valid v and yParity, 0x0", "0x0", "0x0", nil},
+		{"valid v and yParity, 0x1", "0x1", "0x1", nil},
+
+		// Valid v, missing yParity
+		{"valid v, missing yParity, 0x0", "0x0", "", nil},
+		{"valid v, missing yParity, 0x1", "0x1", "", nil},
+
+		// Valid yParity, missing v
+		{"valid yParity, missing v, 0x0", "", "0x0", nil},
+		{"valid yParity, missing v, 0x1", "", "0x1", nil},
+
+		// Invalid yParity
+		{"invalid yParity, 0x2", "", "0x2", errInvalidYParity},
+
+		// Conflicting v and yParity
+		{"conflicting v and yParity", "0x1", "0x0", errVYParityMismatch},
+
+		// Missing v and yParity
+		{"missing v and yParity", "", "", errVYParityMissing},
+	}
+
+	// Run for all types that accept yParity
+	t.Parallel()
+	for _, txType := range []uint64{
+		AccessListTxType,
+		DynamicFeeTxType,
+		BlobTxType,
+	} {
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("txType=%d: %s", txType, test.name), func(t *testing.T) {
+				// Copy the base json
+				testJson := maps.Clone(baseJson)
+
+				// Set v, yParity and type
+				if test.v != "" {
+					testJson["v"] = test.v
+				}
+				if test.yParity != "" {
+					testJson["yParity"] = test.yParity
+				}
+				testJson["type"] = fmt.Sprintf("0x%x", txType)
+
+				// Marshal the JSON
+				jsonBytes, err := json.Marshal(testJson)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				// Unmarshal the tx
+				var tx Transaction
+				err = tx.UnmarshalJSON(jsonBytes)
+				if err != test.wantErr {
+					t.Fatalf("wrong error: got %v, want %v", err, test.wantErr)
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkHash(b *testing.B) {
+	signer := NewLondonSigner(big.NewInt(1))
+	to := common.Address{}
+	tx := NewTx(&DynamicFeeTx{
+		ChainID:   big.NewInt(123),
+		Nonce:     1,
+		Gas:       1000000,
+		To:        &to,
+		Value:     big.NewInt(1),
+		GasTipCap: big.NewInt(500),
+		GasFeeCap: big.NewInt(500),
+	})
+	for b.Loop() {
+		signer.Hash(tx)
+	}
+}
+
+func BenchmarkEffectiveGasTip(b *testing.B) {
+	signer := LatestSigner(params.TestChainConfig)
+	key, _ := crypto.GenerateKey()
+	txdata := &DynamicFeeTx{
+		ChainID:   big.NewInt(1),
+		Nonce:     0,
+		GasTipCap: big.NewInt(2000000000),
+		GasFeeCap: big.NewInt(3000000000),
+		Gas:       21000,
+		To:        &common.Address{},
+		Value:     big.NewInt(0),
+		Data:      nil,
+	}
+	tx, _ := SignNewTx(key, signer, txdata)
+	baseFee := uint256.NewInt(1000000000) // 1 gwei
+
+	b.Run("Original", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, err := tx.EffectiveGasTip(baseFee.ToBig())
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("IntoMethod", func(b *testing.B) {
+		b.ReportAllocs()
+		dst := new(uint256.Int)
+		for b.Loop() {
+			err := tx.calcEffectiveGasTip(dst, baseFee)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func TestEffectiveGasTipInto(t *testing.T) {
+	testCases := []struct {
+		tipCap  int64
+		feeCap  int64
+		baseFee *int64
+	}{
+		{tipCap: 1, feeCap: 100, baseFee: intPtr(50)},
+		{tipCap: 10, feeCap: 100, baseFee: intPtr(50)},
+		{tipCap: 50, feeCap: 100, baseFee: intPtr(50)},
+		{tipCap: 100, feeCap: 100, baseFee: intPtr(50)},
+		{tipCap: 1, feeCap: 50, baseFee: intPtr(50)},
+		{tipCap: 1, feeCap: 20, baseFee: intPtr(50)}, // Base fee higher than fee cap
+		{tipCap: 50, feeCap: 100, baseFee: intPtr(0)},
+		{tipCap: 50, feeCap: 100, baseFee: nil}, // nil base fee
+	}
+
+	// original, non-allocation golfed version
+	orig := func(tx *Transaction, baseFee *big.Int) (*big.Int, error) {
+		if baseFee == nil {
+			return tx.GasTipCap(), nil
+		}
+		var err error
+		gasFeeCap := tx.GasFeeCap()
+		if gasFeeCap.Cmp(baseFee) < 0 {
+			err = ErrGasFeeCapTooLow
+		}
+		gasFeeCap = gasFeeCap.Sub(gasFeeCap, baseFee)
+		gasTipCap := tx.GasTipCap()
+		if gasTipCap.Cmp(gasFeeCap) < 0 {
+			return gasTipCap, err
+		}
+		return gasFeeCap, err
+	}
+
+	for i, tc := range testCases {
+		tx := NewTx(&DynamicFeeTx{
+			ChainID:   big.NewInt(1),
+			Nonce:     0,
+			GasTipCap: big.NewInt(tc.tipCap),
+			GasFeeCap: big.NewInt(tc.feeCap),
+			Gas:       21000,
+			To:        &common.Address{},
+			Value:     big.NewInt(0),
+			Data:      nil,
+		})
+
+		var baseFee *big.Int
+		var baseFee2 *uint256.Int
+		if tc.baseFee != nil {
+			baseFee = big.NewInt(*tc.baseFee)
+			baseFee2 = uint256.NewInt(uint64(*tc.baseFee))
+		}
+
+		// Get result from original method
+		orig, origErr := orig(tx, baseFee)
+
+		// Get result from new method
+		dst := new(uint256.Int)
+		newErr := tx.calcEffectiveGasTip(dst, baseFee2)
+
+		// Compare results
+		if (origErr != nil) != (newErr != nil) {
+			t.Fatalf("case %d: error mismatch: orig %v, new %v", i, origErr, newErr)
+		}
+
+		if origErr == nil && orig.Cmp(dst.ToBig()) != 0 {
+			t.Fatalf("case %d: result mismatch: orig %v, new %v", i, orig, dst)
+		}
+	}
+}
+
+// Helper function to create integer pointer
+func intPtr(i int64) *int64 {
+	return &i
+}
+
+func BenchmarkEffectiveGasTipCmp(b *testing.B) {
+	signer := LatestSigner(params.TestChainConfig)
+	key, _ := crypto.GenerateKey()
+	txdata := &DynamicFeeTx{
+		ChainID:   big.NewInt(1),
+		Nonce:     0,
+		GasTipCap: big.NewInt(2000000000),
+		GasFeeCap: big.NewInt(3000000000),
+		Gas:       21000,
+		To:        &common.Address{},
+		Value:     big.NewInt(0),
+		Data:      nil,
+	}
+	tx, _ := SignNewTx(key, signer, txdata)
+	other, _ := SignNewTx(key, signer, txdata)
+	baseFee := uint256.NewInt(1000000000) // 1 gwei
+
+	b.Run("Original", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			tx.EffectiveGasTipCmp(other, baseFee)
+		}
+	})
 }

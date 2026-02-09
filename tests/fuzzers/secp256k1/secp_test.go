@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/btcsuite/btcd/btcec/v2"
+	dcred_secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/ethereum/go-ethereum/crypto/secp256k1"
 )
 
@@ -35,10 +35,10 @@ func Fuzz(f *testing.F) {
 	})
 }
 
-func fuzz(dataP1, dataP2 []byte) int {
+func fuzz(dataP1, dataP2 []byte) {
 	var (
 		curveA = secp256k1.S256()
-		curveB = btcec.S256()
+		curveB = dcred_secp256k1.S256()
 	)
 	// first point
 	x1, y1 := curveB.ScalarBaseMult(dataP1)
@@ -50,5 +50,4 @@ func fuzz(dataP1, dataP2 []byte) int {
 		fmt.Printf("%s %s %s %s\n", x1, y1, x2, y2)
 		panic(fmt.Sprintf("Addition failed: geth: %s %s btcd: %s %s", resAX, resAY, resBX, resBY))
 	}
-	return 0
 }

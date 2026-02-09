@@ -30,7 +30,6 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -100,7 +99,7 @@ func (a *Account) Balance(ctx context.Context) (hexutil.Big, error) {
 	if err != nil {
 		return hexutil.Big{}, err
 	}
-	balance := state.GetBalance(a.address)
+	balance := state.GetBalance(a.address).ToBig()
 	if balance == nil {
 		return hexutil.Big{}, fmt.Errorf("failed to load balance %x", a.address)
 	}
@@ -230,8 +229,8 @@ func (t *Transaction) resolve(ctx context.Context) (*types.Transaction, *Block) 
 		return t.tx, t.block
 	}
 	// Try to return an already finalized transaction
-	tx, blockHash, _, index, err := t.r.backend.GetTransaction(ctx, t.hash)
-	if err == nil && tx != nil {
+	found, tx, blockHash, _, index := t.r.backend.GetCanonicalTransaction(t.hash)
+	if found {
 		t.tx = tx
 		blockNrOrHash := rpc.BlockNumberOrHashWithHash(blockHash, false)
 		t.block = &Block{
@@ -273,11 +272,15 @@ func (t *Transaction) GasPrice(ctx context.Context) hexutil.Big {
 		return hexutil.Big{}
 	}
 	switch tx.Type() {
-	case types.DynamicFeeTxType:
+	case types.DynamicFeeTxType, types.BlobTxType, types.SetCodeTxType:
 		if block != nil {
 			if baseFee, _ := block.BaseFeePerGas(ctx); baseFee != nil {
 				// price = min(gasTipCap + baseFee, gasFeeCap)
-				return (hexutil.Big)(*math.BigMin(new(big.Int).Add(tx.GasTipCap(), baseFee.ToInt()), tx.GasFeeCap()))
+				gasFeeCap, effectivePrice := tx.GasFeeCap(), new(big.Int).Add(tx.GasTipCap(), baseFee.ToInt())
+				if effectivePrice.Cmp(gasFeeCap) < 0 {
+					return (hexutil.Big)(*effectivePrice)
+				}
+				return (hexutil.Big)(*gasFeeCap)
 			}
 		}
 		return hexutil.Big(*tx.GasPrice())
@@ -302,7 +305,11 @@ func (t *Transaction) EffectiveGasPrice(ctx context.Context) (*hexutil.Big, erro
 	if header.BaseFee == nil {
 		return (*hexutil.Big)(tx.GasPrice()), nil
 	}
-	return (*hexutil.Big)(math.BigMin(new(big.Int).Add(tx.GasTipCap(), header.BaseFee), tx.GasFeeCap())), nil
+	gasFeeCap, effectivePrice := tx.GasFeeCap(), new(big.Int).Add(tx.GasTipCap(), header.BaseFee)
+	if effectivePrice.Cmp(gasFeeCap) < 0 {
+		return (*hexutil.Big)(effectivePrice), nil
+	}
+	return (*hexutil.Big)(gasFeeCap), nil
 }
 
 func (t *Transaction) MaxFeePerGas(ctx context.Context) *hexutil.Big {
@@ -311,7 +318,7 @@ func (t *Transaction) MaxFeePerGas(ctx context.Context) *hexutil.Big {
 		return nil
 	}
 	switch tx.Type() {
-	case types.DynamicFeeTxType, types.BlobTxType:
+	case types.DynamicFeeTxType, types.BlobTxType, types.SetCodeTxType:
 		return (*hexutil.Big)(tx.GasFeeCap())
 	default:
 		return nil
@@ -324,7 +331,7 @@ func (t *Transaction) MaxPriorityFeePerGas(ctx context.Context) *hexutil.Big {
 		return nil
 	}
 	switch tx.Type() {
-	case types.DynamicFeeTxType, types.BlobTxType:
+	case types.DynamicFeeTxType, types.BlobTxType, types.SetCodeTxType:
 		return (*hexutil.Big)(tx.GasTipCap())
 	default:
 		return nil
@@ -568,6 +575,9 @@ func (t *Transaction) getLogs(ctx context.Context, hash common.Hash) (*[]*Log, e
 
 func (t *Transaction) Type(ctx context.Context) *hexutil.Uint64 {
 	tx, _ := t.resolve(ctx)
+	if tx == nil {
+		return nil
+	}
 	txType := hexutil.Uint64(tx.Type())
 	return &txType
 }
@@ -615,13 +625,13 @@ func (t *Transaction) V(ctx context.Context) hexutil.Big {
 	return hexutil.Big(*v)
 }
 
-func (t *Transaction) YParity(ctx context.Context) (*hexutil.Uint64, error) {
+func (t *Transaction) YParity(ctx context.Context) (*hexutil.Big, error) {
 	tx, _ := t.resolve(ctx)
 	if tx == nil || tx.Type() == types.LegacyTxType {
 		return nil, nil
 	}
 	v, _, _ := tx.RawSignatureValues()
-	ret := hexutil.Uint64(v.Int64())
+	ret := hexutil.Big(*v)
 	return &ret, nil
 }
 
@@ -696,6 +706,9 @@ func (b *Block) resolveHeader(ctx context.Context) (*types.Header, error) {
 	b.header, err = b.r.backend.HeaderByNumberOrHash(ctx, *b.numberOrHash)
 	if err != nil {
 		return nil, err
+	}
+	if b.header == nil {
+		return nil, nil
 	}
 	if b.hash == (common.Hash{}) {
 		b.hash = b.header.Hash()
@@ -904,18 +917,6 @@ func (b *Block) LogsBloom(ctx context.Context) (hexutil.Bytes, error) {
 		return hexutil.Bytes{}, err
 	}
 	return header.Bloom.Bytes(), nil
-}
-
-func (b *Block) TotalDifficulty(ctx context.Context) (hexutil.Big, error) {
-	hash, err := b.Hash(ctx)
-	if err != nil {
-		return hexutil.Big{}, err
-	}
-	td := b.r.backend.GetTd(ctx, hash)
-	if td == nil {
-		return hexutil.Big{}, fmt.Errorf("total difficulty not found %x", hash)
-	}
-	return hexutil.Big(*td), nil
 }
 
 func (b *Block) RawHeader(ctx context.Context) (hexutil.Bytes, error) {
@@ -1213,7 +1214,7 @@ func (b *Block) Call(ctx context.Context, args struct {
 func (b *Block) EstimateGas(ctx context.Context, args struct {
 	Data ethapi.TransactionArgs
 }) (hexutil.Uint64, error) {
-	return ethapi.DoEstimateGas(ctx, b.r.backend, args.Data, *b.numberOrHash, nil, b.r.backend.RPCGasCap())
+	return ethapi.DoEstimateGas(ctx, b.r.backend, args.Data, *b.numberOrHash, nil, nil, b.r.backend.RPCGasCap())
 }
 
 type Pending struct {
@@ -1277,7 +1278,7 @@ func (p *Pending) EstimateGas(ctx context.Context, args struct {
 	Data ethapi.TransactionArgs
 }) (hexutil.Uint64, error) {
 	latestBlockNr := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
-	return ethapi.DoEstimateGas(ctx, p.r.backend, args.Data, latestBlockNr, nil, p.r.backend.RPCGasCap())
+	return ethapi.DoEstimateGas(ctx, p.r.backend, args.Data, latestBlockNr, nil, nil, p.r.backend.RPCGasCap())
 }
 
 // Resolver is the top-level object in the GraphQL hierarchy.
@@ -1325,6 +1326,9 @@ func (r *Resolver) Blocks(ctx context.Context, args struct {
 	From *Long
 	To   *Long
 }) ([]*Block, error) {
+	if args.From == nil {
+		return nil, errors.New("from block number must be specified")
+	}
 	from := rpc.BlockNumber(*args.From)
 
 	var to rpc.BlockNumber
@@ -1429,7 +1433,7 @@ func (r *Resolver) Logs(ctx context.Context, args struct{ Filter FilterCriteria 
 		topics = *args.Filter.Topics
 	}
 	// Construct the range filter
-	filter := r.filterSystem.NewRangeFilter(begin, end, addresses, topics)
+	filter := r.filterSystem.NewRangeFilter(begin, end, addresses, topics, 0)
 	return runFilter(ctx, r, filter)
 }
 
@@ -1506,9 +1510,18 @@ func (s *SyncState) HealingTrienodes() hexutil.Uint64 {
 func (s *SyncState) HealingBytecode() hexutil.Uint64 {
 	return hexutil.Uint64(s.progress.HealingBytecode)
 }
+func (s *SyncState) TxIndexFinishedBlocks() hexutil.Uint64 {
+	return hexutil.Uint64(s.progress.TxIndexFinishedBlocks)
+}
+func (s *SyncState) TxIndexRemainingBlocks() hexutil.Uint64 {
+	return hexutil.Uint64(s.progress.TxIndexRemainingBlocks)
+}
+func (s *SyncState) StateIndexRemaining() hexutil.Uint64 {
+	return hexutil.Uint64(s.progress.StateIndexRemaining)
+}
 
 // Syncing returns false in case the node is currently not syncing with the network. It can be up-to-date or has not
-// yet received the latest block headers from its pears. In case it is synchronizing:
+// yet received the latest block headers from its peers. In case it is synchronizing:
 // - startingBlock:       block number this node started to synchronize from
 // - currentBlock:        block number this node is currently importing
 // - highestBlock:        block number of the highest block header this node has received from peers
@@ -1524,11 +1537,13 @@ func (s *SyncState) HealingBytecode() hexutil.Uint64 {
 // - healedBytecodeBytes: number of bytecodes persisted to disk
 // - healingTrienodes:    number of state trie nodes pending
 // - healingBytecode:     number of bytecodes pending
-func (r *Resolver) Syncing() (*SyncState, error) {
-	progress := r.backend.SyncProgress()
+// - txIndexFinishedBlocks:  number of blocks whose transactions are indexed
+// - txIndexRemainingBlocks: number of blocks whose transactions are not indexed yet
+func (r *Resolver) Syncing(ctx context.Context) (*SyncState, error) {
+	progress := r.backend.SyncProgress(ctx)
 
 	// Return not syncing if the synchronisation already completed
-	if progress.CurrentBlock >= progress.HighestBlock {
+	if progress.Done() {
 		return nil, nil
 	}
 	// Otherwise gather the block sync stats
