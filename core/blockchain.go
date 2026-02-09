@@ -2164,11 +2164,13 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 
 	// Process block using the parent state as reference point
 	pstart := time.Now()
+	log.Info("Processing block", "number", block.NumberU64(), "hash", block.Hash(), "txs", len(block.Transactions()), "stateroot_before", statedb.IntermediateRoot(bc.chainConfig.IsEIP158(block.Number())))
 	res, err := bc.processor.Process(block, statedb, bc.cfg.VmConfig)
 	if err != nil {
 		bc.reportBadBlock(block, res, err)
 		return nil, err
 	}
+	log.Info("Processed block", "number", block.NumberU64(), "hash", block.Hash(), "usedGas", res.GasUsed, "stateroot_after", statedb.IntermediateRoot(bc.chainConfig.IsEIP158(block.Number())))
 	ptime := time.Since(pstart)
 
 	vstart := time.Now()
