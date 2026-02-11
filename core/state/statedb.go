@@ -966,6 +966,20 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			s.witnessStats.Add(witness, common.Hash{})
 		}
 	}
+	log.Info("IntermediateRoot computed",
+		"originalRoot", s.originalRoot,
+		"computedRoot", hash,
+		"stateObjects", len(s.stateObjects),
+		"mutations", len(s.mutations),
+		"destructed", len(s.stateObjectsDestruct),
+		"accountLoaded", s.AccountLoaded,
+		"accountUpdated", s.AccountUpdated,
+		"accountDeleted", s.AccountDeleted,
+		"storageLoaded", s.StorageLoaded,
+		"storageUpdated", s.StorageUpdated.Load(),
+		"storageDeleted", s.StorageDeleted.Load(),
+		"dbErr", s.dbErr,
+	)
 	return hash
 }
 
