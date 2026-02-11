@@ -2092,9 +2092,11 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 
 	vstart := time.Now()
 	if err := bc.validator.ValidateState(block, statedb, res, false); err != nil {
+		log.Error("State validation failed", "number", block.NumberU64(), "hash", block.Hash(), "expected_root", block.Root(), "computed_root", statedb.IntermediateRoot(bc.chainConfig.IsEIP158(block.Number())), "err", err)
 		bc.reportBlock(block, res, err)
 		return nil, err
 	}
+	log.Info("State validation passed", "number", block.NumberU64(), "expected_root", block.Root(), "receipt_hash", block.ReceiptHash(), "gas_used", res.GasUsed, "validation_time", time.Since(vstart))
 	vtime := time.Since(vstart)
 
 	// If witnesses was generated and stateless self-validation requested, do
@@ -2159,8 +2161,10 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 		status, err = bc.writeBlockAndSetHead(block, res.Receipts, res.Logs, statedb, false)
 	}
 	if err != nil {
+		log.Error("Failed to write block state", "number", block.NumberU64(), "hash", block.Hash(), "root", block.Root(), "err", err)
 		return nil, err
 	}
+	log.Info("Block state committed", "number", block.NumberU64(), "hash", block.Hash(), "root", block.Root(), "setHead", setHead, "write_time", time.Since(wstart))
 	// Report the collected witness statistics
 	if witnessStats != nil {
 		witnessStats.ReportMetrics(block.NumberU64())
