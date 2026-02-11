@@ -980,6 +980,25 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		"storageDeleted", s.StorageDeleted.Load(),
 		"dbErr", s.dbErr,
 	)
+	for addr, obj := range s.stateObjects {
+		log.Info("StateObject",
+			"addr", addr,
+			"nonce", obj.data.Nonce,
+			"balance", obj.data.Balance,
+			"storageRoot", obj.data.Root,
+			"codeHash", common.BytesToHash(obj.data.CodeHash),
+			"dirtyStorage", len(obj.dirtyStorage),
+			"pendingStorage", len(obj.pendingStorage),
+			"originStorage", len(obj.originStorage),
+		)
+	}
+	for addr, m := range s.mutations {
+		mutType := "update"
+		if m.isDelete() {
+			mutType = "deletion"
+		}
+		log.Info("Mutation", "addr", addr, "type", mutType, "applied", m.applied)
+	}
 	return hash
 }
 
