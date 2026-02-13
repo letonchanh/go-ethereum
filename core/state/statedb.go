@@ -568,12 +568,28 @@ func (s *StateDB) GetTransientState(addr common.Address, key common.Hash) common
 
 // updateStateObject writes the given object to the trie.
 func (s *StateDB) updateStateObject(obj *stateObject) {
+	addr := obj.Address()
+	// Log account state in trie before update
+	if existing, err := s.trie.GetAccount(addr); err == nil && existing != nil {
+		log.Info("updateStateObject before", "addr", addr, "nonce", existing.Nonce, "balance", existing.Balance, "storageRoot", existing.Root, "codeHash", common.BytesToHash(existing.CodeHash))
+	} else {
+		log.Info("updateStateObject before", "addr", addr, "existing", nil, "err", err)
+	}
+	log.Info("updateStateObject new data", "addr", addr, "nonce", obj.data.Nonce, "balance", obj.data.Balance, "storageRoot", obj.data.Root, "codeHash", common.BytesToHash(obj.data.CodeHash), "codeLen", len(obj.code), "dirtyCode", obj.dirtyCode)
+
 	// Encode the account and update the account trie
-	if err := s.trie.UpdateAccount(obj.Address(), &obj.data, len(obj.code)); err != nil {
-		s.setError(fmt.Errorf("updateStateObject (%x) error: %v", obj.Address(), err))
+	if err := s.trie.UpdateAccount(addr, &obj.data, len(obj.code)); err != nil {
+		s.setError(fmt.Errorf("updateStateObject (%x) error: %v", addr, err))
 	}
 	if obj.dirtyCode {
-		s.trie.UpdateContractCode(obj.Address(), common.BytesToHash(obj.CodeHash()), obj.code)
+		s.trie.UpdateContractCode(addr, common.BytesToHash(obj.CodeHash()), obj.code)
+	}
+
+	// Log account state in trie after update
+	if updated, err := s.trie.GetAccount(addr); err == nil && updated != nil {
+		log.Info("updateStateObject after", "addr", addr, "nonce", updated.Nonce, "balance", updated.Balance, "storageRoot", updated.Root, "codeHash", common.BytesToHash(updated.CodeHash))
+	} else {
+		log.Info("updateStateObject after", "addr", addr, "result", nil, "err", err)
 	}
 }
 
