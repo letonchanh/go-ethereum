@@ -429,7 +429,10 @@ func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tr
 	if stateObject == nil {
 		return uint256.Int{}
 	}
-	return stateObject.AddBalance(amount)
+	prevBalance := *stateObject.Balance()
+	ret := stateObject.AddBalance(amount)
+	log.Info("AddBalance", "addr", addr, "amount", amount, "reason", reason, "prevBalance", &prevBalance, "newBalance", stateObject.Balance())
+	return ret
 }
 
 // SubBalance subtracts amount from the account associated with addr.
