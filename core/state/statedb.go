@@ -954,17 +954,33 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		if op.isDelete() {
 			deletedAddrs = append(deletedAddrs, addr)
 		} else {
-			s.updateStateObject(s.stateObjects[addr])
+			obj := s.stateObjects[addr]
+			rootBefore := s.trie.Hash()
+			s.updateStateObject(obj)
+			rootAfter := s.trie.Hash()
+			log.Info("IntermediateRoot step 5: account updated",
+				"addr", addr,
+				"nonce", obj.data.Nonce,
+				"balance", obj.data.Balance,
+				"storageRoot", obj.data.Root,
+				"codeHash", common.BytesToHash(obj.data.CodeHash),
+				"dirtyCode", obj.dirtyCode,
+				"trieRootBefore", rootBefore,
+				"trieRootAfter", rootAfter,
+			)
 			s.AccountUpdated += 1
 		}
 		usedAddrs = append(usedAddrs, addr) // Copy needed for closure
 	}
-	log.Info("IntermediateRoot step 5: after account updates", "trieRoot", s.trie.Hash(), "updatedAddrs", len(usedAddrs)-len(deletedAddrs))
+	log.Info("IntermediateRoot step 5 done: all accounts updated", "trieRoot", s.trie.Hash(), "updatedCount", len(usedAddrs)-len(deletedAddrs))
 	for _, deletedAddr := range deletedAddrs {
+		rootBefore := s.trie.Hash()
 		s.deleteStateObject(deletedAddr)
+		rootAfter := s.trie.Hash()
+		log.Info("IntermediateRoot step 6: account deleted", "addr", deletedAddr, "trieRootBefore", rootBefore, "trieRootAfter", rootAfter)
 		s.AccountDeleted += 1
 	}
-	log.Info("IntermediateRoot step 6: after account deletions", "trieRoot", s.trie.Hash(), "deletedAddrs", len(deletedAddrs))
+	log.Info("IntermediateRoot step 6 done: all accounts deleted", "trieRoot", s.trie.Hash(), "deletedCount", len(deletedAddrs))
 	s.AccountUpdates += time.Since(start)
 
 	if s.prefetcher != nil {
