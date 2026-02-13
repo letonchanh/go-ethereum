@@ -2731,15 +2731,28 @@ func summarizeBadBlock(block *types.Block, receipts []*types.Receipt, config *pa
 	if vcs != "" {
 		vcs = fmt.Sprintf("\nVCS: %s", vcs)
 	}
+	var shanghaiTime, cancunTime int64
+	if config.ShanghaiTime != nil {
+		shanghaiTime = int64(*config.ShanghaiTime)
+	} else {
+		shanghaiTime = -1
+	}
+	if config.CancunTime != nil {
+		cancunTime = int64(*config.CancunTime)
+	} else {
+		cancunTime = -1
+	}
 	return fmt.Sprintf(`
 ########## BAD BLOCK #########
 Block: %v (%#x)
 Error: %v
 Platform: %v%v
 Chain config: %#v
+ShanghaiTime: %d
+CancunTime: %d
 Receipts: %v
 ##############################
-`, block.Number(), block.Hash(), err, platform, vcs, config, receiptString)
+`, block.Number(), block.Hash(), err, platform, vcs, config, shanghaiTime, cancunTime, receiptString)
 }
 
 // InsertHeaderChain attempts to insert the given header chain in to the local
