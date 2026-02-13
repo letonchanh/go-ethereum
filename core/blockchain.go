@@ -2081,7 +2081,18 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 
 	// Process block using the parent state as reference point
 	pstart := time.Now()
-	log.Info("Processing block", "number", block.NumberU64(), "hash", block.Hash(), "txs", len(block.Transactions()), "stateroot_before", statedb.IntermediateRoot(bc.chainConfig.IsEIP158(block.Number())))
+	var shanghaiTime, cancunTime int64
+	if bc.chainConfig.ShanghaiTime != nil {
+		shanghaiTime = int64(*bc.chainConfig.ShanghaiTime)
+	} else {
+		shanghaiTime = -1
+	}
+	if bc.chainConfig.CancunTime != nil {
+		cancunTime = int64(*bc.chainConfig.CancunTime)
+	} else {
+		cancunTime = -1
+	}
+	log.Info("Processing block", "number", block.NumberU64(), "hash", block.Hash(), "txs", len(block.Transactions()), "stateroot_before", statedb.IntermediateRoot(bc.chainConfig.IsEIP158(block.Number())), "chainConfig", bc.chainConfig, "shanghaiTime", shanghaiTime, "cancunTime", cancunTime)
 	res, err := bc.processor.Process(block, statedb, bc.cfg.VmConfig)
 	if err != nil {
 		bc.reportBlock(block, res, err)
