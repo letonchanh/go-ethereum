@@ -788,8 +788,18 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 // It is called in between transactions to get the root hash that
 // goes into transaction receipts.
 func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
+	var trieRoot common.Hash
+	if s.trie != nil {
+		trieRoot = s.trie.Hash()
+	}
+	log.Info("IntermediateRoot step 0: begin", "originalRoot", s.originalRoot, "trieRoot", trieRoot, "trieNil", s.trie == nil, "deleteEmptyObjects", deleteEmptyObjects)
+
 	// Finalise all the dirty storage states and write them into the tries
 	s.Finalise(deleteEmptyObjects)
+	if s.trie != nil {
+		trieRoot = s.trie.Hash()
+	}
+	log.Info("IntermediateRoot step 1: after Finalise", "trieRoot", trieRoot, "trieNil", s.trie == nil)
 
 	// Initialize the trie if it's not constructed yet. If the prefetch
 	// is enabled, the trie constructed below will be replaced by the
@@ -805,6 +815,8 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		}
 		s.trie = tr
 	}
+	log.Info("IntermediateRoot step 2: after trie init", "trieRoot", s.trie.Hash())
+
 	// If there was a trie prefetcher operating, terminate it async so that the
 	// individual storage tries can be updated as soon as the disk load finishes.
 	if s.prefetcher != nil {
@@ -900,6 +912,7 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	}
 	workers.Wait()
 	s.StorageUpdates += time.Since(start)
+	log.Info("IntermediateRoot step 3: after storage updates", "trieRoot", s.trie.Hash(), "storageUpdateTime", time.Since(start))
 
 	// Now we're about to start to write changes to the trie. The trie is so far
 	// _untouched_. We can check with the prefetcher, if it can give us a trie
@@ -916,6 +929,8 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			s.trie = trie
 		}
 	}
+	log.Info("IntermediateRoot step 4: after prefetcher swap", "trieRoot", s.trie.Hash())
+
 	// Perform updates before deletions.  This prevents resolution of unnecessary trie nodes
 	// in circumstances similar to the following:
 	//
@@ -944,10 +959,12 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		}
 		usedAddrs = append(usedAddrs, addr) // Copy needed for closure
 	}
+	log.Info("IntermediateRoot step 5: after account updates", "trieRoot", s.trie.Hash(), "updatedAddrs", len(usedAddrs)-len(deletedAddrs))
 	for _, deletedAddr := range deletedAddrs {
 		s.deleteStateObject(deletedAddr)
 		s.AccountDeleted += 1
 	}
+	log.Info("IntermediateRoot step 6: after account deletions", "trieRoot", s.trie.Hash(), "deletedAddrs", len(deletedAddrs))
 	s.AccountUpdates += time.Since(start)
 
 	if s.prefetcher != nil {

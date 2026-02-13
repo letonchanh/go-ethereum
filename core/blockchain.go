@@ -2747,7 +2747,7 @@ func summarizeBadBlock(block *types.Block, receipts []*types.Receipt, config *pa
 Block: %v (%#x)
 Error: %v
 Platform: %v%v
-Chain config: %#v
+Chain config: %v
 ShanghaiTime: %d
 CancunTime: %d
 Receipts: %v
