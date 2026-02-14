@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -220,26 +221,34 @@ func (b *EthAPIBackend) Pending() (*types.Block, types.Receipts, *state.StateDB)
 }
 
 func (b *EthAPIBackend) StateAndHeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*state.StateDB, *types.Header, error) {
+	log.Info("StateAndHeaderByNumber called", "number", number)
 	// Pending state is only known by the miner
 	if number == rpc.PendingBlockNumber {
 		block, _, state := b.eth.miner.Pending()
 		if block == nil || state == nil {
+			log.Error("StateAndHeaderByNumber pending state not available")
 			return nil, nil, errors.New("pending state is not available")
 		}
+		log.Info("StateAndHeaderByNumber returning pending state", "blockNumber", block.NumberU64(), "blockHash", block.Hash())
 		return state, block.Header(), nil
 	}
 	// Otherwise resolve the block number and return its state
 	header, err := b.HeaderByNumber(ctx, number)
 	if err != nil {
+		log.Error("StateAndHeaderByNumber HeaderByNumber failed", "number", number, "err", err)
 		return nil, nil, err
 	}
 	if header == nil {
+		log.Error("StateAndHeaderByNumber header not found", "number", number)
 		return nil, nil, errors.New("header not found")
 	}
+	log.Info("StateAndHeaderByNumber resolved header", "number", header.Number, "hash", header.Hash(), "stateRoot", header.Root)
 	stateDb, err := b.eth.BlockChain().StateAt(header.Root)
 	if err != nil {
+		log.Warn("StateAndHeaderByNumber StateAt failed, trying HistoricState", "root", header.Root, "err", err)
 		stateDb, err = b.eth.BlockChain().HistoricState(header.Root)
 		if err != nil {
+			log.Error("StateAndHeaderByNumber HistoricState also failed", "root", header.Root, "err", err)
 			return nil, nil, err
 		}
 	}
@@ -247,29 +256,40 @@ func (b *EthAPIBackend) StateAndHeaderByNumber(ctx context.Context, number rpc.B
 }
 
 func (b *EthAPIBackend) StateAndHeaderByNumberOrHash(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*state.StateDB, *types.Header, error) {
+	log.Info("StateAndHeaderByNumberOrHash called", "blockNrOrHash", blockNrOrHash)
 	if blockNr, ok := blockNrOrHash.Number(); ok {
+		log.Info("StateAndHeaderByNumberOrHash resolved to block number", "number", blockNr)
 		return b.StateAndHeaderByNumber(ctx, blockNr)
 	}
 	if hash, ok := blockNrOrHash.Hash(); ok {
+		log.Info("StateAndHeaderByNumberOrHash resolved to hash", "hash", hash)
 		header, err := b.HeaderByHash(ctx, hash)
 		if err != nil {
+			log.Error("StateAndHeaderByNumberOrHash HeaderByHash failed", "hash", hash, "err", err)
 			return nil, nil, err
 		}
 		if header == nil {
+			log.Error("StateAndHeaderByNumberOrHash header for hash not found", "hash", hash)
 			return nil, nil, errors.New("header for hash not found")
 		}
+		log.Info("StateAndHeaderByNumberOrHash resolved header", "number", header.Number, "hash", hash, "stateRoot", header.Root)
 		if blockNrOrHash.RequireCanonical && b.eth.blockchain.GetCanonicalHash(header.Number.Uint64()) != hash {
+			log.Error("StateAndHeaderByNumberOrHash hash is not canonical", "hash", hash, "number", header.Number)
 			return nil, nil, errors.New("hash is not currently canonical")
 		}
 		stateDb, err := b.eth.BlockChain().StateAt(header.Root)
 		if err != nil {
+			log.Warn("StateAndHeaderByNumberOrHash StateAt failed, trying HistoricState", "root", header.Root, "err", err)
 			stateDb, err = b.eth.BlockChain().HistoricState(header.Root)
 			if err != nil {
+				log.Error("StateAndHeaderByNumberOrHash HistoricState also failed", "root", header.Root, "err", err)
 				return nil, nil, err
 			}
 		}
+		log.Info("StateAndHeaderByNumberOrHash success", "number", header.Number, "hash", hash, "stateRoot", header.Root)
 		return stateDb, header, nil
 	}
+	log.Error("StateAndHeaderByNumberOrHash invalid arguments")
 	return nil, nil, errors.New("invalid arguments; neither block nor hash specified")
 }
 

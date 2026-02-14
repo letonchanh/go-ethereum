@@ -326,11 +326,14 @@ func (api *BlockChainAPI) BlockNumber() hexutil.Uint64 {
 // given block number. The rpc.LatestBlockNumber and rpc.PendingBlockNumber meta
 // block numbers are also allowed.
 func (api *BlockChainAPI) GetBalance(ctx context.Context, address common.Address, blockNrOrHash rpc.BlockNumberOrHash) (*hexutil.Big, error) {
-	state, _, err := api.b.StateAndHeaderByNumberOrHash(ctx, blockNrOrHash)
+	log.Info("eth_getBalance called", "address", address, "blockNrOrHash", blockNrOrHash)
+	state, header, err := api.b.StateAndHeaderByNumberOrHash(ctx, blockNrOrHash)
 	if state == nil || err != nil {
+		log.Error("eth_getBalance failed to get state", "address", address, "blockNrOrHash", blockNrOrHash, "err", err)
 		return nil, err
 	}
 	b := state.GetBalance(address).ToBig()
+	log.Info("eth_getBalance result", "address", address, "balance", b, "blockNumber", header.Number, "blockHash", header.Hash(), "stateRoot", header.Root, "stateErr", state.Error())
 	return (*hexutil.Big)(b), state.Error()
 }
 
