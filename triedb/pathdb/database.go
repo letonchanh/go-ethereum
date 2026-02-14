@@ -664,7 +664,21 @@ func (db *Database) AccountIterator(root common.Hash, seek common.Hash) (Account
 	if !db.tree.bottom().genComplete() {
 		return nil, errNotConstructed
 	}
-	return newFastAccountIterator(db, root, seek)
+	it, err := newFastAccountIterator(db, root, seek)
+	if err != nil {
+		log.Warn("AccountIterator: fast iterator failed, falling back to disk iterator", "root", root, "seek", seek, "err", err)
+		diskIt := newDiskAccountIterator(db.tree.bottom().db.diskdb, seek)
+		// Probe a copy to verify disk has data
+		probe := newDiskAccountIterator(db.tree.bottom().db.diskdb, seek)
+		if probe.Next() {
+			log.Info("AccountIterator fallback: disk has data", "firstHash", probe.Hash(), "accountData", fmt.Sprintf("%x", probe.Account()))
+		} else {
+			log.Warn("AccountIterator fallback: disk iterator is empty", "seek", seek)
+		}
+		probe.Release()
+		return diskIt, nil
+	}
+	return it, nil
 }
 
 // StorageIterator creates a new storage iterator for the specified root hash and
@@ -679,7 +693,20 @@ func (db *Database) StorageIterator(root common.Hash, account common.Hash, seek 
 	if !db.tree.bottom().genComplete() {
 		return nil, errNotConstructed
 	}
-	return newFastStorageIterator(db, root, account, seek)
+	it, err := newFastStorageIterator(db, root, account, seek)
+	if err != nil {
+		log.Warn("StorageIterator: fast iterator failed, falling back to disk iterator", "root", root, "account", account, "seek", seek, "err", err)
+		diskIt := newDiskStorageIterator(db.tree.bottom().db.diskdb, account, seek)
+		probe := newDiskStorageIterator(db.tree.bottom().db.diskdb, account, seek)
+		if probe.Next() {
+			log.Info("StorageIterator fallback: disk has data", "account", account, "firstHash", probe.Hash())
+		} else {
+			log.Warn("StorageIterator fallback: disk iterator is empty", "account", account, "seek", seek)
+		}
+		probe.Release()
+		return diskIt, nil
+	}
+	return it, nil
 }
 
 // SnapshotCompleted returns the flag indicating if the snapshot generation is completed.

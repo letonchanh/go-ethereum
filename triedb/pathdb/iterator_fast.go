@@ -24,7 +24,6 @@ import (
 	"sort"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/log"
 )
 
 // weightedIterator is an iterator with an assigned weight. It is used to prioritise
@@ -68,23 +67,7 @@ type fastIterator struct {
 func newFastIterator(db *Database, root common.Hash, account common.Hash, seek common.Hash, accountIterator bool) (*fastIterator, error) {
 	current := db.tree.get(root)
 	if current == nil {
-		log.Warn("newFastIterator: unknown layer, falling back to disk iterator", "root", root, "account", account, "seek", seek, "accountIterator", accountIterator)
-		fi := &fastIterator{
-			account: accountIterator,
-		}
-		if accountIterator {
-			fi.iterators = append(fi.iterators, &weightedIterator{
-				it:       newDiskAccountIterator(db.tree.bottom().db.diskdb, seek),
-				priority: 0,
-			})
-		} else {
-			fi.iterators = append(fi.iterators, &weightedIterator{
-				it:       newDiskStorageIterator(db.tree.bottom().db.diskdb, account, seek),
-				priority: 0,
-			})
-		}
-		fi.init()
-		return fi, nil
+		return nil, fmt.Errorf("unknown layer: %x", root)
 	}
 	fi := &fastIterator{
 		account: accountIterator,
