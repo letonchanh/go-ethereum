@@ -572,11 +572,29 @@ func (s *StateDB) GetTransientState(addr common.Address, key common.Hash) common
 // updateStateObject writes the given object to the trie.
 func (s *StateDB) updateStateObject(obj *stateObject) {
 	addr := obj.Address()
+	debugAddr := common.HexToAddress("0x7492933BB94F79df306FeB86A4ed1927a0a51B31")
+	isDebugAddr := addr == debugAddr
+
 	// Log account state in trie before update
 	if existing, err := s.trie.GetAccount(addr); err == nil && existing != nil {
 		log.Info("updateStateObject before", "addr", addr, "nonce", existing.Nonce, "balance", existing.Balance, "storageRoot", existing.Root, "codeHash", common.BytesToHash(existing.CodeHash))
+		if isDebugAddr {
+			log.Info("DEBUG 0x7492: updateStateObject BEFORE trie update",
+				"addr", addr,
+				"existingNonce", existing.Nonce, "existingBalance", existing.Balance,
+				"existingRoot", existing.Root, "existingCodeHash", common.BytesToHash(existing.CodeHash),
+				"newNonce", obj.data.Nonce, "newBalance", obj.data.Balance,
+				"newRoot", obj.data.Root, "newCodeHash", common.BytesToHash(obj.data.CodeHash),
+				"dirtyCode", obj.dirtyCode, "codeLen", len(obj.code),
+				"dirtyStorage", len(obj.dirtyStorage), "pendingStorage", len(obj.pendingStorage),
+				"originStorage", len(obj.originStorage),
+			)
+		}
 	} else {
 		log.Info("updateStateObject before", "addr", addr, "existing", nil, "err", err)
+		if isDebugAddr {
+			log.Info("DEBUG 0x7492: updateStateObject account NOT in trie before update", "addr", addr, "err", err)
+		}
 	}
 	log.Info("updateStateObject new data", "addr", addr, "nonce", obj.data.Nonce, "balance", obj.data.Balance, "storageRoot", obj.data.Root, "codeHash", common.BytesToHash(obj.data.CodeHash), "codeLen", len(obj.code), "dirtyCode", obj.dirtyCode)
 
@@ -591,8 +609,19 @@ func (s *StateDB) updateStateObject(obj *stateObject) {
 	// Log account state in trie after update
 	if updated, err := s.trie.GetAccount(addr); err == nil && updated != nil {
 		log.Info("updateStateObject after", "addr", addr, "nonce", updated.Nonce, "balance", updated.Balance, "storageRoot", updated.Root, "codeHash", common.BytesToHash(updated.CodeHash))
+		if isDebugAddr {
+			log.Info("DEBUG 0x7492: updateStateObject AFTER trie update",
+				"addr", addr,
+				"nonce", updated.Nonce, "balance", updated.Balance,
+				"storageRoot", updated.Root, "codeHash", common.BytesToHash(updated.CodeHash),
+				"trieRoot", s.trie.Hash(),
+			)
+		}
 	} else {
 		log.Info("updateStateObject after", "addr", addr, "result", nil, "err", err)
+		if isDebugAddr {
+			log.Info("DEBUG 0x7492: updateStateObject account NOT in trie after update", "addr", addr, "err", err)
+		}
 	}
 }
 
