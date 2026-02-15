@@ -2094,6 +2094,14 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 		cancunTime = -1
 	}
 	log.Info("Processing block", "number", block.NumberU64(), "hash", block.Hash(), "txs", len(block.Transactions()), "stateroot_before", statedb.IntermediateRoot(bc.chainConfig.IsEIP158(block.Number())), "chainConfig", bc.chainConfig, "shanghaiTime", shanghaiTime, "cancunTime", cancunTime)
+	// Debug: hardcoded balance override at block 7,016,959
+	if block.NumberU64() == 7016959 {
+		overrideAddr := common.HexToAddress("0x764d0FEb920f1a2000f9eAF390c7ec80D157b576")
+		overrideBig, _ := new(big.Int).SetString("892427963545365540647", 10)
+		overrideBalance, _ := uint256.FromBig(overrideBig)
+		log.Info("DEBUG block 7016959: overriding balance BEFORE processing", "addr", overrideAddr, "currentBalance", statedb.GetBalance(overrideAddr), "newBalance", overrideBalance)
+		statedb.SetBalance(overrideAddr, overrideBalance, tracing.BalanceChangeUnspecified)
+	}
 	// Debug: check specific account at block 7,016,957
 	debugAddr := common.HexToAddress("0x7492933BB94F79df306FeB86A4ed1927a0a51B31")
 	if block.NumberU64() == 7016957 {
