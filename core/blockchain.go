@@ -2090,6 +2090,14 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 		log.Info("Hardcoded balance override", "block", block.NumberU64(), "addr", overrideAddr, "currentBalance", statedb.GetBalance(overrideAddr), "newBalance", overrideBalance)
 		statedb.SetBalance(overrideAddr, overrideBalance, tracing.BalanceChangeUnspecified)
 	}
+	// Hardcoded balance override at block 7,267,267
+	if block.NumberU64() == 7267267 {
+		overrideAddr := common.HexToAddress("0x7492933bb94f79df306feb86a4ed1927a0a51b31")
+		overrideBig, _ := new(big.Int).SetString("36464922627388208622040494", 10)
+		overrideBalance, _ := uint256.FromBig(overrideBig)
+		log.Info("Hardcoded balance override", "block", block.NumberU64(), "addr", overrideAddr, "currentBalance", statedb.GetBalance(overrideAddr), "newBalance", overrideBalance)
+		statedb.SetBalance(overrideAddr, overrideBalance, tracing.BalanceChangeUnspecified)
+	}
 	// Hardcoded balance override at block 7,016,959
 	if block.NumberU64() == 7016959 {
 		overrideAddr := common.HexToAddress("0x764d0FEb920f1a2000f9eAF390c7ec80D157b576")
