@@ -8,12 +8,24 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 )
+
+// BalanceChangeEvent records a single balance modification during block processing.
+type BalanceChangeEvent struct {
+	Address       common.Address
+	PrevBalance   string
+	NewBalance    string
+	Amount        string // positive for add, negative for sub
+	Reason        tracing.BalanceChangeReason
+	IsAdd         bool // true for add/set-increase, false for sub/set-decrease
+}
 
 // StateTransitionLogger writes JSONL records for each block's state transitions.
 type StateTransitionLogger struct {
@@ -34,20 +46,54 @@ type BlockTransitionLog struct {
 	Errors        []string               `json:"errors,omitempty"`
 }
 
+// BalanceChangeLog records a single balance change event.
+type BalanceChangeLog struct {
+	PrevBalance string `json:"prev_balance"`
+	NewBalance  string `json:"new_balance"`
+	Amount      string `json:"amount"`
+	Reason      string `json:"reason"`
+}
+
 // AccountTransitionLog records per-account state change details.
 type AccountTransitionLog struct {
-	Address           string `json:"address"`
-	MutationType      string `json:"mutation_type"`
-	BalanceBefore     string `json:"balance_before"`
-	BalanceAfter      string `json:"balance_after"`
-	NonceBefore       uint64 `json:"nonce_before"`
-	NonceAfter        uint64 `json:"nonce_after"`
-	InMemProofValid   bool   `json:"in_mem_proof_valid"`
-	DiskProofValid    bool   `json:"disk_proof_valid"`
-	InMemDiskMatch    bool   `json:"in_mem_disk_match"`
-	InMemProofError   string `json:"in_mem_proof_error,omitempty"`
-	DiskProofError    string `json:"disk_proof_error,omitempty"`
-	StateMismatchNote string `json:"state_mismatch_note,omitempty"`
+	Address           string             `json:"address"`
+	MutationType      string             `json:"mutation_type"`
+	BalanceBefore     string             `json:"balance_before"`
+	BalanceAfter      string             `json:"balance_after"`
+	NonceBefore       uint64             `json:"nonce_before"`
+	NonceAfter        uint64             `json:"nonce_after"`
+	BalanceChanges    []BalanceChangeLog `json:"balance_changes"`
+	InMemProofValid   bool               `json:"in_mem_proof_valid"`
+	InMemProof        []string           `json:"in_mem_proof"`
+	DiskProofValid    bool               `json:"disk_proof_valid"`
+	DiskProof         []string           `json:"disk_proof"`
+	InMemDiskMatch    bool               `json:"in_mem_disk_match"`
+	InMemProofError   string             `json:"in_mem_proof_error,omitempty"`
+	DiskProofError    string             `json:"disk_proof_error,omitempty"`
+	StateMismatchNote string             `json:"state_mismatch_note,omitempty"`
+}
+
+// proofList implements ethdb.KeyValueWriter and collects proof nodes in order.
+type proofList [][]byte
+
+func (p *proofList) Put(key []byte, value []byte) error {
+	node := make([]byte, len(value))
+	copy(node, value)
+	*p = append(*p, node)
+	return nil
+}
+
+func (p *proofList) Delete(key []byte) error {
+	return nil
+}
+
+// toHexStrings converts proof nodes to hex-encoded strings.
+func (p proofList) toHexStrings() []string {
+	result := make([]string, len(p))
+	for i, node := range p {
+		result[i] = hexutil.Encode(node)
+	}
+	return result
 }
 
 // NewStateTransitionLogger creates a logger that appends JSONL to the given file path.
@@ -79,6 +125,18 @@ func (l *StateTransitionLogger) write(record *BlockTransitionLog) {
 	if _, err := l.file.Write(data); err != nil {
 		log.Error("Failed to write state transition log", "err", err)
 	}
+}
+
+// recordBalanceChange appends a balance change event to the StateDB's event log.
+func (s *StateDB) recordBalanceChange(addr common.Address, prev, new string, amount string, reason tracing.BalanceChangeReason, isAdd bool) {
+	s.balanceChangeEvents = append(s.balanceChangeEvents, BalanceChangeEvent{
+		Address:     addr,
+		PrevBalance: prev,
+		NewBalance:  new,
+		Amount:      amount,
+		Reason:      reason,
+		IsAdd:       isAdd,
+	})
 }
 
 // LogStateTransitions iterates over s.mutations, captures before/after balances,
@@ -119,6 +177,12 @@ func (s *StateDB) LogStateTransitions(
 			"failed to open disk trie from parent root: "+diskTrieErr.Error())
 	}
 
+	// Index balance change events by address for quick lookup.
+	changesByAddr := make(map[common.Address][]BalanceChangeEvent)
+	for _, evt := range s.balanceChangeEvents {
+		changesByAddr[evt.Address] = append(changesByAddr[evt.Address], evt)
+	}
+
 	var accounts []AccountTransitionLog
 	for addr, m := range s.mutations {
 		entry := AccountTransitionLog{
@@ -152,15 +216,35 @@ func (s *StateDB) LogStateTransitions(
 			entry.NonceAfter = 0
 		}
 
+		// --- Fine-grained balance changes ---
+		if events, ok := changesByAddr[addr]; ok {
+			for _, evt := range events {
+				entry.BalanceChanges = append(entry.BalanceChanges, BalanceChangeLog{
+					PrevBalance: evt.PrevBalance,
+					NewBalance:  evt.NewBalance,
+					Amount:      evt.Amount,
+					Reason:      evt.Reason.String(),
+				})
+			}
+		}
+
 		hashedKey := crypto.Keccak256(addr.Bytes())
 
 		// --- In-memory trie proof (post-transition) ---
 		if s.trie != nil {
-			proofDB := memorydb.New()
-			if err := s.trie.Prove(hashedKey, proofDB); err != nil {
+			var proof proofList
+			if err := s.trie.Prove(hashedKey, &proof); err != nil {
 				entry.InMemProofError = err.Error()
 			} else {
-				val, err := trie.VerifyProof(computedRoot, hashedKey, proofDB)
+				entry.InMemProof = proof.toHexStrings()
+
+				// Also verify with memorydb for correctness check
+				verifyDB := memorydb.New()
+				for _, node := range proof {
+					hash := crypto.Keccak256Hash(node)
+					verifyDB.Put(hash.Bytes(), node)
+				}
+				val, err := trie.VerifyProof(computedRoot, hashedKey, verifyDB)
 				if err != nil {
 					entry.InMemProofValid = false
 					entry.InMemProofError = "verification failed: " + err.Error()
@@ -183,11 +267,18 @@ func (s *StateDB) LogStateTransitions(
 
 		// --- Disk trie proof (from parent root, pre-transition) ---
 		if diskTrie != nil {
-			proofDB := memorydb.New()
-			if err := diskTrie.Prove(hashedKey, proofDB); err != nil {
+			var proof proofList
+			if err := diskTrie.Prove(hashedKey, &proof); err != nil {
 				entry.DiskProofError = err.Error()
 			} else {
-				val, err := trie.VerifyProof(s.originalRoot, hashedKey, proofDB)
+				entry.DiskProof = proof.toHexStrings()
+
+				verifyDB := memorydb.New()
+				for _, node := range proof {
+					hash := crypto.Keccak256Hash(node)
+					verifyDB.Put(hash.Bytes(), node)
+				}
+				val, err := trie.VerifyProof(s.originalRoot, hashedKey, verifyDB)
 				if err != nil {
 					entry.DiskProofValid = false
 					entry.DiskProofError = "verification failed: " + err.Error()

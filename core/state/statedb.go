@@ -156,6 +156,9 @@ type StateDB struct {
 	StorageLoaded  int          // Number of storage slots retrieved from the database during the state transition
 	StorageUpdated atomic.Int64 // Number of storage slots updated during the state transition
 	StorageDeleted atomic.Int64 // Number of storage slots deleted during the state transition
+
+	// Debug: records all balance change events during block processing
+	balanceChangeEvents []BalanceChangeEvent
 }
 
 // New creates a new state from a given trie.
@@ -429,7 +432,10 @@ func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tr
 	if stateObject == nil {
 		return uint256.Int{}
 	}
-	return stateObject.AddBalance(amount)
+	prev := stateObject.Balance().String()
+	result := stateObject.AddBalance(amount)
+	s.recordBalanceChange(addr, prev, result.String(), "+"+amount.String(), reason, true)
+	return result
 }
 
 // SubBalance subtracts amount from the account associated with addr.
@@ -441,13 +447,18 @@ func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tr
 	if amount.IsZero() {
 		return *(stateObject.Balance())
 	}
-	return stateObject.SetBalance(new(uint256.Int).Sub(stateObject.Balance(), amount))
+	prev := stateObject.Balance().String()
+	result := stateObject.SetBalance(new(uint256.Int).Sub(stateObject.Balance(), amount))
+	s.recordBalanceChange(addr, prev, result.String(), "-"+amount.String(), reason, false)
+	return result
 }
 
 func (s *StateDB) SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) {
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
+		prev := stateObject.Balance().String()
 		stateObject.SetBalance(amount)
+		s.recordBalanceChange(addr, prev, amount.String(), amount.String(), reason, true)
 	}
 }
 
