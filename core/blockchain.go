@@ -337,7 +337,8 @@ type BlockChain struct {
 	logger     *tracing.Hooks
 	stateSizer *state.SizeTracker // State size tracking
 
-	lastForkReadyAlert time.Time // Last time there was a fork readiness print out
+	lastForkReadyAlert    time.Time                    // Last time there was a fork readiness print out
+	stateTransitionLogger *state.StateTransitionLogger // Debug: state transition logger
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -540,6 +541,15 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 			log.Info("Failed to setup size tracker", "err", err)
 		}
 	}
+	// Initialize state transition debug logger
+	stLogger, stLogErr := state.NewStateTransitionLogger("/root/.ethereum/state_transitions.log")
+	if stLogErr != nil {
+		log.Error("Failed to initialize state transition logger", "path", "/root/.ethereum/state_transitions.log", "err", stLogErr)
+	} else {
+		bc.stateTransitionLogger = stLogger
+		log.Info("State transition logging enabled", "path", "/root/.ethereum/state_transitions.log")
+	}
+
 	return bc, nil
 }
 
@@ -1282,6 +1292,9 @@ func (bc *BlockChain) stopWithoutSaving() {
 // Stop stops the blockchain service. If any imports are currently in progress
 // it will abort them using the procInterrupt.
 func (bc *BlockChain) Stop() {
+	if bc.stateTransitionLogger != nil {
+		bc.stateTransitionLogger.Close()
+	}
 	bc.stopWithoutSaving()
 
 	// Ensure that the entirety of the state snapshot is journaled to disk.
@@ -2094,6 +2107,11 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 		return nil, err
 	}
 	vtime := time.Since(vstart)
+
+	// Debug: log state transitions after validation (trie is populated, root is verified)
+	if bc.stateTransitionLogger != nil {
+		statedb.LogStateTransitions(bc.stateTransitionLogger, block.NumberU64(), block.Hash(), block.Root(), parentRoot)
+	}
 
 	// If witnesses was generated and stateless self-validation requested, do
 	// that now. Self validation should *never* run in production, it's more of
