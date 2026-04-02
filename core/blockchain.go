@@ -1911,6 +1911,8 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 			parent = bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
 		}
 		// The traced section of block import.
+		log.Info("Importing new block", "number", block.Number(), "hash", block.Hash(),
+			"txs", len(block.Transactions()), "gas", block.GasLimit(), "uncles", len(block.Uncles()))
 		start := time.Now()
 		res, err := bc.ProcessBlock(parent.Root, block, setHead, makeWitness && len(chain) == 1)
 		if err != nil {
